@@ -2,13 +2,13 @@ use std::{
     io::{self, BufReader, Write as _},
     mem::forget,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use clap::Parser;
 use fs_err::File;
-use memofs::Vfs;
+use memofs::{StdBackend, Vfs, VfsBackend, VfsEvent};
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 
@@ -18,7 +18,7 @@ use crate::{
     syncback::{syncback_loop, FsSnapshot},
 };
 
-use super::{resolve_path, GlobalOptions};
+use super::{resolve_path, resolve_project_path, GlobalOptions};
 
 const UNKNOWN_INPUT_KIND_ERR: &str = "Could not detect what kind of file was inputted. \
                                        Expected input file to end in .rbxl, .rbxlx, .rbxm, or .rbxmx.";
@@ -32,6 +32,7 @@ const UNKNOWN_INPUT_KIND_ERR: &str = "Could not detect what kind of file was inp
 ///
 /// To ease programmatic use, this command pipes all normal output to stderr.
 #[derive(Debug, Parser)]
+#[clap(group(clap::ArgGroup::new("watch_consent").args(&["non-interactive", "dry-run"]).multiple(true)))]
 pub struct SyncbackCommand {
     /// Path to the project to sync back to.
     #[clap(default_value = "")]
@@ -54,16 +55,42 @@ pub struct SyncbackCommand {
     /// If provided, the prompt for writing to the file system is skipped.
     #[clap(long, short = 'y')]
     pub non_interactive: bool,
+
+    /// Repeat syncback when the input file changes. Requires -y or --dry-run.
+    #[clap(long, requires = "watch_consent")]
+    pub watch: bool,
 }
 
 impl SyncbackCommand {
     pub fn run(&self, global: GlobalOptions) -> anyhow::Result<()> {
-        let path_old = resolve_path(&self.project)?;
+        let path_old = resolve_project_path(&self.project)?;
         let path_new = resolve_path(&self.input)?;
 
         let input_kind = FileKind::from_path(&path_new).context(UNKNOWN_INPUT_KIND_ERR)?;
+        if self.watch {
+            ensure!(
+                self.non_interactive || self.dry_run,
+                "--watch requires -y or --dry-run"
+            );
+            return self.run_watch(&path_old, &path_new, input_kind, &global);
+        }
+        self.run_once(&path_old, &path_new, input_kind, &global, None)
+    }
+
+    fn run_once(
+        &self,
+        path_old: &Path,
+        path_new: &Path,
+        input_kind: FileKind,
+        global: &GlobalOptions,
+        captured: Option<&[u8]>,
+    ) -> anyhow::Result<()> {
         let dom_start_timer = Instant::now();
-        let dom_new = read_dom(&path_new, input_kind)?;
+        let content: Box<dyn io::Read + '_> = match captured {
+            Some(bytes) => Box::new(bytes),
+            None => Box::new(File::open(path_new)?),
+        };
+        let dom_new = read_dom(path_new, input_kind, content)?;
         log::debug!(
             "Finished opening file in {:0.02}s",
             dom_start_timer.elapsed().as_secs_f32()
@@ -73,7 +100,7 @@ impl SyncbackCommand {
         vfs.set_watch_enabled(false);
 
         let project_start_timer = Instant::now();
-        let session_old = ServeSession::new(vfs, path_old.clone())?;
+        let session_old = ServeSession::new_for_offline(vfs, path_old)?;
         log::debug!(
             "Finished opening project in {:0.02}s",
             project_start_timer.elapsed().as_secs_f32()
@@ -111,6 +138,9 @@ impl SyncbackCommand {
         );
 
         let base_path = session_old.root_project().folder_location();
+        if self.watch {
+            protect_input(&snapshot, base_path, path_new)?;
+        }
         if self.list {
             list_files(&snapshot, global.color.into(), base_path)?;
         }
@@ -133,7 +163,9 @@ impl SyncbackCommand {
                 }
             }
             eprintln!("Writing to the file system...");
-            snapshot.write_to_vfs(base_path, session_old.vfs())?;
+            snapshot
+                .write_to_vfs(base_path, session_old.vfs())
+                .map_err(SyncbackWriteError)?;
             eprintln!("Finished syncback.")
         } else {
             eprintln!(
@@ -148,14 +180,107 @@ impl SyncbackCommand {
         // and the program is about to exit anyway so we're just going to forget
         // about it.
         drop(dom_old);
-        forget(session_old);
+        if !self.watch {
+            forget(session_old);
+        }
 
         Ok(())
     }
+
+    fn run_watch(
+        &self,
+        project: &Path,
+        input: &Path,
+        kind: FileKind,
+        global: &GlobalOptions,
+    ) -> anyhow::Result<()> {
+        let input = dunce::canonicalize(input)
+            .with_context(|| format!("Could not watch input {}", input.display()))?;
+        let mut watcher =
+            StdBackend::new().context("Could not initialize syncback input watcher")?;
+        watcher
+            .watch(&input)
+            .with_context(|| format!("Could not watch input {}", input.display()))?;
+        let events = watcher.event_receiver();
+        let bytes = fs_err::read(&input)?;
+        self.run_once(project, &input, kind, global, Some(&bytes))?;
+        let mut last_hash = blake3::hash(&bytes);
+        drop(bytes);
+        eprintln!("Watching syncback input {}", input.display());
+        loop {
+            let event = events
+                .recv()
+                .context("Syncback input watcher disconnected")?;
+            if !affects_input(&event, &input) {
+                continue;
+            }
+            let deadline = Instant::now() + Duration::from_millis(100);
+            // Do not extend the window for unrelated output notifications or
+            // consume events that arrive while planning/writing the next pass.
+            while events.recv_deadline(deadline).is_ok() {}
+            let _ = watcher.unwatch(&input);
+            if let Err(error) = watcher.watch(&input) {
+                log::debug!(
+                    "Waiting to re-register syncback input {}: {}",
+                    input.display(),
+                    error
+                );
+            }
+            let result = (|| {
+                let bytes = fs_err::read(&input)?;
+                let hash = blake3::hash(&bytes);
+                if hash != last_hash {
+                    self.run_once(project, &input, kind, global, Some(&bytes))?;
+                    last_hash = hash;
+                }
+                Ok::<_, anyhow::Error>(())
+            })();
+            if let Err(error) = result {
+                if error.downcast_ref::<SyncbackWriteError>().is_some() {
+                    return Err(error);
+                }
+                log::warn!(
+                    "Syncback input {} was not applied; waiting for a later save: {:#}",
+                    input.display(),
+                    error
+                );
+            }
+        }
+    }
 }
 
-fn read_dom(path: &Path, file_kind: FileKind) -> anyhow::Result<WeakDom> {
-    let content = BufReader::new(File::open(path)?);
+#[derive(Debug, thiserror::Error)]
+#[error("Could not write syncback output: {0}")]
+struct SyncbackWriteError(io::Error);
+
+fn affects_input(event: &VfsEvent, input: &Path) -> bool {
+    match event {
+        VfsEvent::Create(path) | VfsEvent::Write(path) => path == input,
+        VfsEvent::Remove(path) => input.starts_with(path),
+        _ => false,
+    }
+}
+
+fn protect_input(snapshot: &FsSnapshot, base: &Path, input: &Path) -> anyhow::Result<()> {
+    for path in snapshot
+        .added_files()
+        .into_iter()
+        .chain(snapshot.removed_paths())
+    {
+        let path = base.join(path);
+        let path = dunce::canonicalize(&path).unwrap_or(path);
+        ensure!(
+            !input.starts_with(&path),
+            "Syncback output would overwrite watched input {} via {}",
+            input.display(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn read_dom(path: &Path, file_kind: FileKind, content: impl io::Read) -> anyhow::Result<WeakDom> {
+    let content = BufReader::new(content);
     match file_kind {
         FileKind::Rbxl => rbx_binary::from_reader(content).with_context(|| {
             format!(
@@ -279,4 +404,32 @@ fn list_files(snapshot: &FsSnapshot, color: ColorChoice, base_path: &Path) -> io
     buffer.set_color(&no_color)?;
 
     writer.print(&buffer)
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_guard_protects_input_and_removal_ancestors_but_allows_other_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        fs_err::create_dir(base.join("src")).unwrap();
+        let input = base.join("src/input.rbxm");
+        fs_err::write(&input, b"input").unwrap();
+        let overwrite = FsSnapshot::new().with_added_file("src/input.rbxm", Vec::new());
+        assert!(protect_input(&overwrite, &base, &input).is_err());
+        let alias = FsSnapshot::new().with_added_file("src/../src/input.rbxm", Vec::new());
+        assert!(protect_input(&alias, &base, &input).is_err());
+        let mut remove_file = FsSnapshot::new();
+        remove_file.remove_file("src/input.rbxm");
+        assert!(protect_input(&remove_file, &base, &input).is_err());
+        let mut remove_dir = FsSnapshot::new();
+        remove_dir.remove_dir("src");
+        assert!(protect_input(&remove_dir, &base, &input).is_err());
+        let other = FsSnapshot::new()
+            .with_added_dir("src")
+            .with_added_file("src/Example.luau", Vec::new());
+        assert!(protect_input(&other, &base, &input).is_ok());
+    }
 }

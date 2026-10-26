@@ -1,7 +1,6 @@
 local StudioService = game:GetService("StudioService")
 local RunService = game:GetService("RunService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
-local SerializationService = game:GetService("SerializationService")
 local Selection = game:GetService("Selection")
 
 local Packages = script.Parent.Parent.Packages
@@ -19,6 +18,13 @@ local Reconciler = require(script.Parent.Reconciler)
 local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
 local orderSwaps = require(script.Parent.orderSwaps)
+local unknownRemovalWarning = require(script.Parent.unknownRemovalWarning)
+local placeIdError = require(script.Parent.placeIdError)
+local StudioOutput = require(script.Parent.StudioOutput)
+local serializedFallback = require(script.Parent.serializedFallback)
+local SourceWrites = require(script.Parent.SourceWrites)
+local ClassAuthority = require(script.Parent.ClassAuthority)
+local LiveTopology = require(script.Parent.LiveTopology)
 
 local Status = strict("Session.Status", {
 	NotStarted = "NotStarted",
@@ -63,6 +69,7 @@ ServeSession.Status = Status
 local validateServeOptions = t.strictInterface({
 	apiContext = t.table,
 	twoWaySync = t.boolean,
+	beforeHydrate = t.optional(t.callback),
 })
 
 function ServeSession.new(options)
@@ -71,7 +78,29 @@ function ServeSession.new(options)
 	-- Declare self ahead of time to capture it in a closure
 	local self
 	local function onInstanceChanged(instance, propertyName)
+		if self and self.__applyingPatch and propertyName ~= "Source" then
+			self.__topology:recordAppliedChange(self.__instanceMap.fromInstances[instance], propertyName)
+			return
+		end
+		if propertyName == "Parent" or propertyName == "Name" then
+			return
+		end
 		if not self.__twoWaySync then
+			return
+		end
+		if self.__classAuthority:explicit(self.__instanceMap.fromInstances[instance]) then
+			return
+		end
+		if propertyName == "Source" and self.__sourceWrites then
+			if self.__status == Status.Connected then
+				local id = self.__instanceMap.fromInstances[instance]
+				local ok, source = pcall(function()
+					return instance.Source
+				end)
+				if id and ok then
+					self.__sourceWrites:edit(id, source)
+				end
+			end
 			return
 		end
 
@@ -79,10 +108,18 @@ function ServeSession.new(options)
 	end
 
 	local function onChangesFlushed(patch)
-		self.__apiContext:write(patch)
+		if self:__ensurePlaceAllowed() then
+			self.__apiContext:write(patch)
+		end
 	end
 
-	local instanceMap = InstanceMap.new(onInstanceChanged)
+	local instanceMap = InstanceMap.new(onInstanceChanged, function(instance)
+		if self and self.__status == Status.Connected then
+			self.__topologySuppressIdle = false
+			self.__topology:mark(self.__instanceMap.fromInstances[instance])
+			self:__scheduleTopology()
+		end
+	end)
 	local changeBatcher = ChangeBatcher.new(instanceMap, onChangesFlushed)
 	local reconciler = Reconciler.new(instanceMap)
 
@@ -109,9 +146,28 @@ function ServeSession.new(options)
 		__precommitCallbacks = {},
 		__postcommitCallbacks = {},
 		__updateLoadingText = function() end,
+		__readyObservers = {},
+		__beforeHydrate = options.beforeHydrate,
 	}
 
 	setmetatable(self, ServeSession)
+	self.__topology = LiveTopology.new(instanceMap)
+	self.__classAuthority = ClassAuthority.new(instanceMap)
+	for _, signal in { ChangeHistoryService.OnUndo, ChangeHistoryService.OnRedo } do
+		table.insert(
+			connections,
+			signal:Connect(function()
+				-- Undo may restore a deliberately different topology. Recheck before
+				-- the next server patch rather than immediately undoing the Undo.
+				self.__topologySuppressIdle = true
+			end)
+		)
+	end
+	if options.apiContext.__observeSocket then
+		self.__cleanupSocketObserver = options.apiContext:__observeSocket(function()
+			self:__notifyReady()
+		end)
+	end
 
 	return self
 end
@@ -133,6 +189,28 @@ end
 
 function ServeSession:onStatusChanged(callback)
 	self.__statusChangedCallback = callback
+end
+
+function ServeSession:observeReady(callback)
+	self.__readyObservers[callback] = true
+	callback(self.__status == Status.Connected and self.__apiContext.__socketOpen == true, self.__status)
+	return function()
+		self.__readyObservers[callback] = nil
+	end
+end
+
+function ServeSession:__notifyReady(detail)
+	for callback in self.__readyObservers do
+		local ok, err = pcall(
+			callback,
+			self.__status == Status.Connected and self.__apiContext.__socketOpen == true,
+			self.__status,
+			detail
+		)
+		if not ok then
+			Log.warn("Session readiness observer failed: {}", err)
+		end
+	end
 end
 
 function ServeSession:setConfirmCallback(callback)
@@ -190,21 +268,68 @@ function ServeSession:hookPostcommit(callback)
 end
 
 function ServeSession:start()
+	if self.__status ~= Status.NotStarted then
+		return
+	end
 	self:__setStatus(Status.Connecting)
 	self:setLoadingText("Connecting to server...")
+	if self.__status ~= Status.Connecting then
+		return
+	end
 
-	self.__apiContext
+	self.__startupPromise = self.__apiContext
 		:connect()
 		:andThen(function(serverInfo)
+			if self.__status ~= Status.Connecting then
+				return
+			end
+			self.__serverSessionId = serverInfo.sessionId
+			self.__serverInfo = serverInfo
+			if self.__twoWaySync then
+				if table.find(serverInfo.capabilities or {}, "writeReceiptsV1") then
+					self.__apiContext.__writeReceipts = true
+					self.__sourceWrites = SourceWrites.new(self.__apiContext, self.__instanceMap)
+				else
+					Log.warn(
+						"This server only acknowledges queued writes; file persistence is not confirmed. Update the server for source write receipts."
+					)
+				end
+			end
+			table.insert(
+				self.__connections,
+				game:GetPropertyChangedSignal("PlaceId"):Connect(function()
+					self:__ensurePlaceAllowed()
+				end)
+			)
 			self:setLoadingText("Loading initial data from server...")
 			return self:__initialSync(serverInfo):andThen(function()
+				if self.__status ~= Status.Connecting then
+					return
+				end
 				self:setLoadingText("Starting sync loop...")
+				if self.__status ~= Status.Connecting then
+					return
+				end
 				self:__setStatus(Status.Connected, serverInfo.projectName)
+				if self.__status ~= Status.Connected then
+					return
+				end
 				self:__applyGameAndPlaceId(serverInfo)
+				if self.__status ~= Status.Connected then
+					return
+				end
+
+				self.__studioOutput = StudioOutput.fromServerInfo(self.__apiContext, serverInfo)
+				if self.__studioOutput then
+					self.__studioOutput:start()
+				end
 
 				return self.__apiContext:connectWebSocket({
 					["messages"] = function(messagesPacket)
 						if self.__status == Status.Disconnected then
+							return
+						end
+						if not self:__ensurePlaceAllowed() then
 							return
 						end
 
@@ -212,6 +337,9 @@ function ServeSession:start()
 
 						for _, message in messagesPacket.messages do
 							self:__applyPatch(message)
+							if self.__status == Status.Disconnected then
+								return
+							end
 						end
 						self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
 					end,
@@ -219,6 +347,7 @@ function ServeSession:start()
 			end)
 		end)
 		:catch(function(err)
+			self.__startupPromise = nil
 			if self.__status ~= Status.Disconnected then
 				self:__stopInternal(err)
 			end
@@ -227,6 +356,20 @@ end
 
 function ServeSession:stop()
 	self:__stopInternal()
+end
+
+function ServeSession:__ensurePlaceAllowed()
+	if self.__status == Status.Disconnected then
+		return false
+	end
+	if self.__serverInfo then
+		local err = placeIdError(self.__serverInfo, game.PlaceId)
+		if err then
+			self:__stopInternal("Studio place ID is no longer allowed by the connected project.\n" .. err)
+			return false
+		end
+	end
+	return true
 end
 
 function ServeSession:__applyGameAndPlaceId(serverInfo)
@@ -279,8 +422,27 @@ function ServeSession:__onActiveScriptChanged(activeScript)
 end
 
 function ServeSession:__replaceInstances(idList)
+	for _, id in idList do
+		local instance = self.__instanceMap.fromIds[id]
+		if instance and self.__classAuthority:containsHeld(instance) then
+			self.__classAuthority:requireReview()
+			self:__stopInternal("Serialized replacement would discard Studio-owned properties; reconnect and review.")
+			return false
+		end
+	end
+	if self.__sourceWrites then
+		local allowed = {}
+		for _, id in idList do
+			if not self.__sourceWrites:protects(self.__instanceMap.fromIds[id]) then
+				table.insert(allowed, id)
+			else
+				Log.warn("Serialization fallback skipped {} to retain unconfirmed local source edits", id)
+			end
+		end
+		idList = allowed
+	end
 	if #idList == 0 then
-		return true, PatchSet.newEmpty()
+		return true, PatchSet.newEmpty(), {}
 	end
 	-- It would be annoying if selection went away, so we try to preserve it.
 	local selection = Selection:Get()
@@ -289,35 +451,14 @@ function ServeSession:__replaceInstances(idList)
 		selectionMap[instance] = i
 	end
 
-	-- TODO: Should we do this in multiple requests so we can more granularly mark failures?
-	local modelSuccess, replacements = self.__apiContext
-		:serialize(idList)
-		:andThen(function(response)
-			Log.debug("Deserializing results from serialize endpoint")
-			local objects = SerializationService:DeserializeInstancesAsync(response.modelContents)
-			if not objects[1] then
-				return Promise.reject("Serialize endpoint did not deserialize into any Instances")
-			end
-			if #objects[1]:GetChildren() ~= #idList then
-				return Promise.reject("Serialize endpoint did not return the correct number of Instances")
-			end
-
-			local instanceMap = {}
-			for _, item in objects[1]:GetChildren() do
-				instanceMap[item.Name] = item.Value
-			end
-			return instanceMap
-		end)
-		:await()
-
-	local refSuccess, refPatch = self.__apiContext
-		:refPatch(idList)
-		:andThen(function(response)
-			return response.patch
-		end)
-		:await()
-
-	if not (modelSuccess and refSuccess) then
+	local replacements, refPatch = serializedFallback(self.__apiContext, idList)
+	if not refPatch or next(replacements) == nil then
+		return false
+	end
+	if not self:__ensurePlaceAllowed() then
+		for _, replacement in replacements do
+			replacement:Destroy()
+		end
 		return false
 	end
 
@@ -334,6 +475,7 @@ function ServeSession:__replaceInstances(idList)
 		if not oldInstance then
 			-- TODO: Why would this happen?
 			Log.warn("Instance {} not found in InstanceMap during sync replacement", id)
+			replacement:Destroy()
 			continue
 		end
 
@@ -344,6 +486,7 @@ function ServeSession:__replaceInstances(idList)
 		})
 	end
 
+	local replacedIds = {}
 	for _, swap in orderSwaps(swaps) do
 		local id, replacement, oldInstance = swap.id, swap.replacement, swap.oldInstance
 
@@ -382,12 +525,14 @@ function ServeSession:__replaceInstances(idList)
 				attemptReparent(child, oldInstance)
 			end
 			attemptReparent(oldInstance, oldParent)
+			self.__instanceMap:insert(id, oldInstance)
 
 			-- Our replacement should never have existed in the first place, so we can just destroy it.
 			replacement:Destroy()
 			continue
 		end
 
+		replacedIds[id] = true
 		if selectionMap[oldInstance] then
 			-- This is a bit funky, but it saves the order of Selection
 			-- which might matter for some use cases.
@@ -395,16 +540,74 @@ function ServeSession:__replaceInstances(idList)
 		end
 	end
 
+	if next(replacedIds) == nil then
+		return false
+	end
 	local patchApplySuccess, unappliedPatch = pcall(self.__reconciler.applyPatch, self.__reconciler, refPatch)
 	if patchApplySuccess then
 		Selection:Set(selection)
-		return true, unappliedPatch
+		return true, unappliedPatch, replacedIds
 	else
 		error(unappliedPatch)
 	end
 end
 
+function ServeSession:__scheduleTopology()
+	if self.__topologyScheduled or self.__topology.checking or RunService:IsRunning() then
+		return
+	end
+	self.__topologyScheduled = true
+	task.defer(function()
+		self.__topologyScheduled = false
+		if self.__status ~= Status.Connected or self.__topologySuppressIdle or RunService:IsRunning() then
+			return
+		end
+		local recovered, reason, reviewRoots = self.__topology:check(
+			PatchSet.newEmpty(),
+			Settings:get("adoptMatchingInstances"),
+			function()
+				return self:__protectedIds()
+			end,
+			function()
+				local recording = ChangeHistoryService:TryBeginRecording("Rojo: Topology recovery")
+				if not recording then
+					return nil
+				end
+				return function()
+					ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
+				end
+			end
+		)
+		if not recovered then
+			self.__classAuthority:requireReview()
+			for instance in reviewRoots or {} do
+				SourceWrites.requireReview(instance)
+			end
+			self:__stopInternal(reason)
+		end
+	end)
+end
+
+function ServeSession:__protectedIds()
+	local result = self.__classAuthority:protectedIds()
+	for id in if self.__sourceWrites then self.__sourceWrites:protectedIds() else {} do
+		result[id] = true
+	end
+	return result
+end
+
 function ServeSession:__applyPatch(patch)
+	if not self:__ensurePlaceAllowed() then
+		return
+	end
+	if self.__status == Status.Connected then
+		local ok, prepared, reason = pcall(self.__classAuthority.prepare, self.__classAuthority, patch)
+		if not ok or not prepared then
+			self:__stopInternal(if ok then reason else tostring(prepared))
+			return
+		end
+		patch = prepared
+	end
 	local patchTimestamp = DateTime.now():FormatLocalTime("LTS", "en-us")
 	local historyRecording = ChangeHistoryService:TryBeginRecording("Rojo: Patch " .. patchTimestamp)
 	if not historyRecording then
@@ -423,7 +626,63 @@ function ServeSession:__applyPatch(patch)
 	end
 	Timer.stop()
 
-	local patchApplySuccess, unappliedPatch = pcall(self.__reconciler.applyPatch, self.__reconciler, patch)
+	if not self:__ensurePlaceAllowed() then
+		if historyRecording then
+			ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
+		end
+		return
+	end
+	if self.__sourceWrites then
+		local allowed, reason = self.__sourceWrites:prepare(patch)
+		if not allowed then
+			if historyRecording then
+				ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
+			end
+			self:__stopInternal(reason)
+			return
+		end
+	end
+	if self.__status == Status.Connected and not RunService:IsRunning() then
+		local recovered, topologyReason, reviewRoots = self.__topology:check(
+			patch,
+			Settings:get("adoptMatchingInstances"),
+			function()
+				return self:__protectedIds()
+			end,
+			function()
+				return if historyRecording then function() end else nil
+			end
+		)
+		if not recovered then
+			self.__classAuthority:requireReview()
+			for instance in reviewRoots or {} do
+				SourceWrites.requireReview(instance)
+			end
+			if historyRecording then
+				ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
+			end
+			self:__stopInternal(topologyReason)
+			return
+		end
+		self.__topologySuppressIdle = false
+	end
+	self.__applyingPatch = true
+	local patchApplySuccess, unappliedPatch, adoptionConflict = pcall(
+		self.__reconciler.applyPatch,
+		self.__reconciler,
+		patch,
+		self.__status == Status.Connected and Settings:get("adoptMatchingInstances")
+	)
+	self.__applyingPatch = false
+	if patchApplySuccess and adoptionConflict then
+		if historyRecording then
+			-- Cancel can undo pending manual Studio edits, including the very
+			-- object this refusal must preserve. No patch mutation took place.
+			ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
+		end
+		self:__stopInternal(adoptionConflict)
+		return
+	end
 	if not patchApplySuccess then
 		if historyRecording then
 			ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
@@ -440,21 +699,37 @@ function ServeSession:__applyPatch(patch)
 
 		Log.debug("ServeSession:__replaceInstances(unappliedPatch.added)")
 		Timer.start("ServeSession:__replaceInstances(unappliedPatch.added)")
-		local addSuccess, unappliedAddedRefs = self:__replaceInstances(addedIdList)
+		local addSuccess, unappliedAddedRefs, addedIds = self:__replaceInstances(addedIdList)
 		Timer.stop()
 
 		Log.debug("ServeSession:__replaceInstances(unappliedPatch.updated)")
 		Timer.start("ServeSession:__replaceInstances(unappliedPatch.updated)")
-		local updateSuccess, unappliedUpdateRefs = self:__replaceInstances(updatedIdList)
+		local updateSuccess, unappliedUpdateRefs, updatedIds = self:__replaceInstances(updatedIdList)
 		Timer.stop()
+		if self.__status == Status.Disconnected then
+			if historyRecording then
+				ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
+			end
+			return
+		end
 
 		-- Update the unapplied patch to reflect which Instances were replaced successfully
 		if addSuccess then
-			table.clear(unappliedPatch.added)
+			for id in addedIds do
+				unappliedPatch.added[id] = nil
+			end
+		end
+		if updateSuccess then
+			for i = #unappliedPatch.updated, 1, -1 do
+				if updatedIds[unappliedPatch.updated[i].id] then
+					table.remove(unappliedPatch.updated, i)
+				end
+			end
+		end
+		if addSuccess then
 			PatchSet.assign(unappliedPatch, unappliedAddedRefs)
 		end
 		if updateSuccess then
-			table.clear(unappliedPatch.updated)
 			PatchSet.assign(unappliedPatch, unappliedUpdateRefs)
 		end
 	end
@@ -465,6 +740,8 @@ function ServeSession:__applyPatch(patch)
 			PatchSet.humanSummary(self.__instanceMap, unappliedPatch)
 		)
 	end
+	self.__topology:accept(patch, unappliedPatch)
+	self.__classAuthority:accept(patch)
 
 	Timer.start("postcommitCallbacks")
 	-- Postcommit callbacks can be called with spawn since regardless of firing order, they are
@@ -485,16 +762,39 @@ function ServeSession:__applyPatch(patch)
 end
 
 function ServeSession:__initialSync(serverInfo)
+	if self.__status ~= Status.Connecting or not self:__ensurePlaceAllowed() then
+		return Promise.resolve()
+	end
 	return self.__apiContext:read({ serverInfo.rootInstanceId }):andThen(function(readResponseBody)
+		if self.__status ~= Status.Connecting then
+			return
+		end
 		-- Tell the API Context that we're up-to-date with the version of
 		-- the tree defined in this response.
 		self.__apiContext:setMessageCursor(readResponseBody.messageCursor)
+		self.__classAuthority:seed(
+			readResponseBody.instances,
+			readResponseBody.classAuthority,
+			table.find(serverInfo.capabilities or {}, "classAuthorityV1") ~= nil,
+			{ sessionId = serverInfo.sessionId, root = game, rootId = serverInfo.rootInstanceId }
+		)
+		if self.__sourceWrites then
+			self.__sourceWrites:seed(readResponseBody.instances, readResponseBody.writeSources)
+		end
 
 		-- For any instances that line up with the Rojo server's view, start
 		-- tracking them in the reconciler.
 		Log.trace("Matching existing Roblox instances to Rojo IDs")
 		self:setLoadingText("Hydrating instance map...")
-		self.__reconciler:hydrate(readResponseBody.instances, serverInfo.rootInstanceId, game)
+		if self.__beforeHydrate then
+			self.__beforeHydrate(serverInfo, readResponseBody.instances)
+			if self.__status ~= Status.Connecting then
+				return
+			end
+		end
+		self.__classAuthority:validateHydration(readResponseBody.instances, serverInfo.rootInstanceId, game)
+		self.__reconciler:hydrate(readResponseBody.instances, serverInfo.rootInstanceId, game, serverInfo.sessionId)
+		self.__topology:seed(readResponseBody.instances, serverInfo.rootInstanceId)
 
 		-- Calculate the initial patch to apply to the DataModel to catch us
 		-- up to what Rojo thinks the place should look like.
@@ -505,6 +805,15 @@ function ServeSession:__initialSync(serverInfo)
 
 		if not success then
 			Log.error("Could not compute a diff to catch up to the Rojo server: {:#?}", catchUpPatch)
+		end
+		catchUpPatch.classAuthority = readResponseBody.classAuthority
+		local authorityReview
+		catchUpPatch, authorityReview = self.__classAuthority:initial(catchUpPatch)
+		serverInfo.classAuthorityReview = authorityReview
+		if authorityReview and self.__userConfirmCallback == nil then
+			return Promise.reject(
+				"Studio-owned properties require explicit reconnect review before changing authority or structure"
+			)
 		end
 
 		for _, update in catchUpPatch.updated do
@@ -523,13 +832,33 @@ function ServeSession:__initialSync(serverInfo)
 		Log.trace("Computed hydration patch: {:#?}", debugPatch(catchUpPatch))
 
 		local userDecision = "Accept"
+		local sourceReview = SourceWrites.needsReview()
+		local reviewedSources = SourceWrites.reviewedIn(self.__instanceMap)
+		serverInfo.sourceWriteReview = sourceReview
+		if sourceReview and self.__userConfirmCallback == nil then
+			return Promise.reject(
+				"Unconfirmed Studio source edits require explicit initial-sync review before reconnecting"
+			)
+		end
+		local warning = unknownRemovalWarning(catchUpPatch)
+		if warning then
+			Log.warn("{}", warning)
+		end
 		if self.__userConfirmCallback ~= nil then
 			userDecision = self.__userConfirmCallback(self.__instanceMap, catchUpPatch, serverInfo)
+		end
+		if self.__status ~= Status.Connecting then
+			return
 		end
 
 		if userDecision == "Abort" then
 			return Promise.reject("Aborted Rojo sync operation")
 		elseif userDecision == "Reject" then
+			if authorityReview then
+				return Promise.reject(
+					"Class authority review requires Accept or Abort; export Studio-owned properties with explicit syncback"
+				)
+			end
 			if not self.__twoWaySync then
 				return Promise.reject("Cannot reject sync operation without two-way sync enabled")
 			end
@@ -545,7 +874,7 @@ function ServeSession:__initialSync(serverInfo)
 					continue
 				end
 
-				local update = encodePatchUpdate(instance, change.id, change.changedProperties)
+				local update = encodePatchUpdate(instance, change.id, change.changedProperties, self.__instanceMap)
 				table.insert(inversePatch.updated, update)
 			end
 			-- Add the removed instances back to Rojo
@@ -558,9 +887,19 @@ function ServeSession:__initialSync(serverInfo)
 				table.insert(inversePatch.removed, id)
 			end
 
+			if self.__sourceWrites then
+				return self.__sourceWrites:writeInitial(inversePatch):andThen(function()
+					if sourceReview then
+						SourceWrites.clearReviewed(reviewedSources)
+					end
+				end)
+			end
 			return self.__apiContext:write(inversePatch)
 		elseif userDecision == "Accept" then
 			self:__applyPatch(catchUpPatch)
+			if sourceReview then
+				SourceWrites.clearReviewed(reviewedSources)
+			end
 			return Promise.resolve()
 		else
 			return Promise.reject("Invalid user decision: " .. userDecision)
@@ -569,8 +908,41 @@ function ServeSession:__initialSync(serverInfo)
 end
 
 function ServeSession:__stopInternal(err)
+	if self.__status == Status.Disconnected then
+		return
+	end
+	if self.__status == Status.Connected then
+		self.__reconciler:rememberSession(self.__serverSessionId, game)
+	end
 	self:__setStatus(Status.Disconnected, err)
+	local startup = self.__startupPromise
+	self.__startupPromise = nil
+	if startup then
+		-- Stop can run inside a startup callback. Cancel once that callback has
+		-- returned so Promise never tries to close its currently running thread.
+		task.defer(function()
+			startup:cancel()
+		end)
+	end
+	if self.__studioOutput then
+		self.__studioOutput:stop()
+		self.__studioOutput = nil
+	end
+	if self.__debuggerPlans then
+		self.__debuggerPlans:stop()
+		self.__debuggerPlans = nil
+	end
+	if self.__sourceWrites then
+		self.__sourceWrites:stop()
+	end
+	self.__topology:stop()
+	self.__classAuthority:stop()
 	self.__apiContext:disconnect()
+	if self.__cleanupSocketObserver then
+		self.__cleanupSocketObserver()
+		self.__cleanupSocketObserver = nil
+	end
+	table.clear(self.__readyObservers)
 	self.__instanceMap:stop()
 	self.__changeBatcher:stop()
 
@@ -586,6 +958,7 @@ function ServeSession:__setStatus(status, detail)
 	if self.__statusChangedCallback ~= nil then
 		self.__statusChangedCallback(status, detail)
 	end
+	self:__notifyReady(detail)
 end
 
 return ServeSession

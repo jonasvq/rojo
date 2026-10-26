@@ -1,0 +1,16 @@
+{
+  "className": "Model",
+  "attributes": { "Rojo_Target_PrimaryPart": "demo-pad" },
+  "children": [
+    {
+      "name": "Pad",
+      "className": "Part",
+      "attributes": { "Rojo_Id": "demo-pad" },
+      "properties": {
+        "Anchored": true,
+        "Color": [0.15, 0.45, 0.9],
+        "Size": [12, 1, 12]
+      }
+    }
+  ]
+}

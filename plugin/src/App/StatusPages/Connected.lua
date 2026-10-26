@@ -13,6 +13,8 @@ local StudioPluginGui = require(Plugin.App.Components.Studio.StudioPluginGui)
 local Header = require(Plugin.App.Components.Header)
 local IconButton = require(Plugin.App.Components.IconButton)
 local TextButton = require(Plugin.App.Components.TextButton)
+local DebuggerPanel = require(Plugin.App.Components.DebuggerPanel)
+local SourceWritesPanel = require(Plugin.App.Components.SourceWritesPanel)
 local BorderedContainer = require(Plugin.App.Components.BorderedContainer)
 local Tooltip = require(Plugin.App.Components.Tooltip)
 local PatchVisualizer = require(Plugin.App.Components.PatchVisualizer)
@@ -352,20 +354,30 @@ function ConnectedPage:render()
 			Heading = e("Frame", {
 				BackgroundTransparency = 1,
 				Size = UDim2.new(1, 0, 0, 32),
+				AutomaticSize = Enum.AutomaticSize.Y,
 			}, {
+				Layout = e("UIListLayout", {
+					FillDirection = Enum.FillDirection.Horizontal,
+					HorizontalFlex = Enum.UIFlexAlignment.SpaceBetween,
+					VerticalAlignment = Enum.VerticalAlignment.Center,
+					SortOrder = Enum.SortOrder.LayoutOrder,
+					Wraps = true,
+					Padding = UDim.new(0, 8),
+				}),
 				Header = e(Header, {
 					transparency = self.props.transparency,
+					fitContent = true,
+					layoutOrder = 1,
 				}),
 
 				ChangeInfo = e("TextButton", {
 					Text = "",
-					Size = UDim2.new(0, 0, 1, 0),
+					Size = UDim2.fromOffset(0, 32),
+					LayoutOrder = 2,
 					AutomaticSize = Enum.AutomaticSize.X,
 					BackgroundColor3 = theme.BorderedContainer.BorderedColor,
 					BackgroundTransparency = if self.state.hoveringChangeInfo then 0.7 else 1,
 					BorderSizePixel = 0,
-					Position = UDim2.new(1, -5, 0.5, 0),
-					AnchorPoint = Vector2.new(1, 0.5),
 					[Roact.Event.MouseEnter] = function()
 						self:setState({
 							hoveringChangeInfo = true,
@@ -478,6 +490,14 @@ function ConnectedPage:render()
 					SortOrder = Enum.SortOrder.LayoutOrder,
 					Padding = UDim.new(0, 10),
 				}),
+			}),
+
+			Debugger = e(DebuggerPanel, { session = self.props.serveSession, transparency = self.props.transparency }),
+			SourceWrites = e(SourceWritesPanel, {
+				session = self.props.serveSession,
+				onReview = function(studio, file)
+					self:setState({ showingStringDiff = true, currentString = studio, incomingString = file })
+				end,
 			}),
 
 			ChangesViewer = e(StudioPluginGui, {

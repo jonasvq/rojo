@@ -28,6 +28,10 @@ local function Popup(props)
 		local contentSize = textBounds + TEXT_PADDING + (Vector2.one * 2)
 
 		local trigger = props.Trigger:getValue()
+		-- Text measurement can yield while virtualization removes the trigger.
+		if trigger == nil or trigger.Parent == nil then
+			return nil
+		end
 
 		local spaceBelow = props.parentSize.Y
 			- (trigger.AbsolutePosition.Y + trigger.AbsoluteSize.Y - Y_OVERLAP + TAIL_SIZE)

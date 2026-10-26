@@ -85,6 +85,8 @@ pub struct ServeSession {
     /// A channel to send mutation requests on. These will be handled by the
     /// ChangeProcessor and trigger changes in the tree.
     tree_mutation_sender: Sender<PatchSet>,
+    receipt_sender: Sender<crate::write_receipts::Command>,
+    receipts: crate::write_receipts::Shared,
 }
 
 impl ServeSession {
@@ -95,29 +97,75 @@ impl ServeSession {
     /// currently loaded from the filesystem directly instead of through the
     /// in-memory filesystem layer.
     pub fn new<P: AsRef<Path>>(vfs: Vfs, start_path: P) -> Result<Self, ServeSessionError> {
+        Self::new_with_context(vfs, start_path.as_ref(), false, false)
+    }
+
+    pub(crate) fn new_for_sourcemap<P: AsRef<Path>>(
+        vfs: Vfs,
+        start_path: P,
+    ) -> Result<Self, ServeSessionError> {
+        Self::new_with_context(vfs, start_path.as_ref(), true, true)
+    }
+
+    pub(crate) fn new_for_offline<P: AsRef<Path>>(
+        vfs: Vfs,
+        start_path: P,
+    ) -> Result<Self, ServeSessionError> {
+        Self::new_with_context(vfs, start_path.as_ref(), false, true)
+    }
+
+    fn new_with_context(
+        vfs: Vfs,
+        start_path: &Path,
+        sourcemap_only: bool,
+        offline_session: bool,
+    ) -> Result<Self, ServeSessionError> {
+        let _operation = crate::diagnostic_context::enter("loading serve session", start_path);
         let start_time = Instant::now();
-        let start_path = vfs.canonicalize(start_path.as_ref())?;
+        let start_path = vfs.canonicalize(start_path)?;
         let start_path = start_path.as_path();
 
         log::trace!("Starting new ServeSession at path {}", start_path.display());
 
         let root_project = Project::load_initial_project(&vfs, start_path)?;
 
-        let mut tree = RojoTree::new(InstanceSnapshot::new());
-
-        let root_id = tree.get_root_id();
-
-        let instance_context =
-            InstanceContext::with_emit_legacy_scripts(root_project.emit_legacy_scripts);
+        let mut instance_context = InstanceContext::with_emit_legacy_scripts(Some(
+            root_project.effective_emit_legacy_scripts(),
+        ));
+        instance_context.sourcemap_only = sourcemap_only;
+        instance_context.offline_session = offline_session;
 
         log::trace!("Generating snapshot of instances from VFS");
         let snapshot = snapshot_from_vfs(&instance_context, &vfs, start_path)?;
 
+        Self::from_snapshot(vfs, root_project, start_time, snapshot, None)
+    }
+
+    pub(crate) fn new_from_stdin(vfs: Vfs, project: Project) -> Result<Self, ServeSessionError> {
+        let started = Instant::now();
+        let snapshot = Some(crate::builder::stdin_snapshot(&vfs, &project)?);
+        let frozen = Arc::new(project.clone());
+        Self::from_snapshot(vfs, project, started, snapshot, Some(frozen))
+    }
+
+    fn from_snapshot(
+        vfs: Vfs,
+        root_project: Project,
+        start_time: Instant,
+        snapshot: Option<InstanceSnapshot>,
+        frozen_project: Option<Arc<Project>>,
+    ) -> Result<Self, ServeSessionError> {
+        crate::sync_authority::check_live_authority(snapshot.as_ref())?;
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let root_id = tree.get_root_id();
         log::trace!("Computing initial patch set");
         let patch_set = compute_patch_set(snapshot, &tree, root_id);
 
         log::trace!("Applying initial patch set");
         apply_patch_set(&mut tree, patch_set);
+
+        // Warn once at startup, rather than on every filesystem re-snapshot.
+        root_project.warn_duplicate_paths(&vfs);
 
         let session_id = SessionId::new();
         let message_queue = MessageQueue::new();
@@ -127,6 +175,9 @@ impl ServeSession {
         let vfs = Arc::new(vfs);
 
         let (tree_mutation_sender, tree_mutation_receiver) = crossbeam_channel::unbounded();
+        let (receipt_sender, receipt_receiver) =
+            crossbeam_channel::bounded(crate::write_receipts::PENDING_LIMIT);
+        let receipts = Arc::new(Mutex::new(crate::write_receipts::Broker::default()));
 
         log::trace!("Starting ChangeProcessor");
         let change_processor = ChangeProcessor::start(
@@ -134,6 +185,12 @@ impl ServeSession {
             Arc::clone(&vfs),
             Arc::clone(&message_queue),
             tree_mutation_receiver,
+            frozen_project,
+            crate::write_receipts::Processor {
+                receiver: receipt_receiver,
+                session_id,
+                broker: Arc::clone(&receipts),
+            },
         );
 
         Ok(Self {
@@ -144,12 +201,10 @@ impl ServeSession {
             tree,
             message_queue,
             tree_mutation_sender,
+            receipt_sender,
+            receipts,
             vfs,
         })
-    }
-
-    pub fn tree_handle(&self) -> Arc<Mutex<RojoTree>> {
-        Arc::clone(&self.tree)
     }
 
     pub fn tree(&self) -> MutexGuard<'_, RojoTree> {
@@ -158,6 +213,13 @@ impl ServeSession {
 
     pub fn tree_mutation_sender(&self) -> Sender<PatchSet> {
         self.tree_mutation_sender.clone()
+    }
+
+    pub(crate) fn receipt_sender(&self) -> Sender<crate::write_receipts::Command> {
+        self.receipt_sender.clone()
+    }
+    pub(crate) fn receipts(&self) -> crate::write_receipts::Shared {
+        Arc::clone(&self.receipts)
     }
 
     #[allow(unused)]
@@ -247,6 +309,55 @@ mod test {
     use super::*;
 
     use memofs::StdBackend;
+
+    #[test]
+    fn live_authority_rejects_unknown_instance_classes_before_transport() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("default.project.json"), r#"{"name":"Root","syncAuthority":[{"className":"BasePart","properties":"studio"}],"tree":{"$className":"UnknownFutureClass"}}"#).unwrap();
+        let error = ServeSession::new(Vfs::new_default().unwrap(), directory.path())
+            .err()
+            .expect("unknown authority class was accepted");
+        assert!(
+            error.to_string().contains("Unknown managed instance class"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn studio_property_authority_supports_live_sessions_with_filesystem_structure() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("default.project.json"), r#"{"name":"Root","syncAuthority":[{"className":"BasePart","properties":"studio"}],"tree":{"$className":"Folder","Pole":{"$className":"Part"}}}"#).unwrap();
+        assert!(ServeSession::new(Vfs::new_default().unwrap(), directory.path()).is_ok());
+    }
+
+    #[test]
+    fn staged_non_filesystem_authority_allows_offline_build_but_refuses_live_session() {
+        use memofs::{InMemoryFs, VfsSnapshot};
+        use serde_json::json;
+        for policy in [
+            json!({"className":"Part","properties":"twoWay"}),
+            json!({"className":"Part","properties":"filesystem","structure":"twoWay"}),
+        ] {
+            let mut fs = InMemoryFs::new();
+            fs.load_snapshot("/project", VfsSnapshot::dir([("default.project.json", VfsSnapshot::file(json!({"name":"Root","syncAuthority":[policy],"tree":{"$className":"Folder","Pole":{"$className":"Part"}}}).to_string()))])).unwrap();
+            let vfs = Vfs::new(fs.clone());
+            let project =
+                Project::load_exact(&vfs, "/project/default.project.json".as_ref(), None).unwrap();
+            assert!(crate::build_project(&vfs, &project).is_ok());
+            let error = match ServeSession::new(vfs, "/project/default.project.json") {
+                Ok(_) => panic!("Unimplemented live authority was accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("reviewed client authority"),
+                "{error}"
+            );
+            let sourcemap =
+                ServeSession::new_for_sourcemap(Vfs::new(fs), "/project/default.project.json")
+                    .unwrap();
+            assert_eq!(sourcemap.tree().root().name(), "Root");
+        }
+    }
 
     #[test]
     fn tree_is_keyed_by_canonical_paths() {

@@ -102,6 +102,19 @@ function SettingsPage:render()
 				transparency = self.props.transparency,
 				layoutOrder = layoutIncrement(),
 			}),
+			HeadlessAPI = e(Setting, {
+				id = "enableHeadlessAPI",
+				name = "Plugin API",
+				description = "Allow other Studio plugins to request scoped Rojo access. Each plugin requires approval.",
+				transparency = self.props.transparency,
+				layoutOrder = layoutIncrement(),
+			}),
+			PluginAccess = e("TextButton", {
+				Text = "Manage plugin API access",
+				Size = UDim2.new(1, 0, 0, 32),
+				LayoutOrder = layoutIncrement(),
+				[Roact.Event.Activated] = self.props.onPluginAccess,
+			}),
 
 			ShowNotifications = e(Setting, {
 				id = "showNotifications",
@@ -229,10 +242,21 @@ function SettingsPage:render()
 				layoutOrder = layoutIncrement(),
 			}),
 
+			AdoptMatchingInstances = e(Setting, {
+				id = "adoptMatchingInstances",
+				name = "Adopt Saved Studio Instances",
+				description = "Reuse uniquely matching untracked Studio objects after checking readable live properties. Serialization-only fields stay unchanged in Studio and are reported as unverified; builds may differ. The project then owns the objects, including later deletions. Conflicts stop sync for review.",
+				locked = self.props.syncActive,
+				lockedTooltip = "(Disconnect before changing adoption.)",
+				tag = "unstable",
+				transparency = self.props.transparency,
+				layoutOrder = layoutIncrement(),
+			}),
+
 			TwoWaySync = e(Setting, {
 				id = "twoWaySync",
 				name = "Two-Way Sync",
-				description = "Editing files in Studio will sync them into the filesystem",
+				description = "Write managed script Source to files. Compatible servers confirm readback and pause conflicting edits for review; older servers only acknowledge queued writes.",
 				locked = self.props.syncActive,
 				lockedTooltip = "(Cannot change while currently syncing. Disconnect first.)",
 				tag = "unstable",

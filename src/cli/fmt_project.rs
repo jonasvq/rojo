@@ -6,7 +6,7 @@ use memofs::Vfs;
 
 use crate::project::Project;
 
-use super::resolve_path;
+use super::resolve_project_path;
 
 /// Reformat a Rojo project using the standard JSON formatting rules.
 #[derive(Debug, Parser)]
@@ -21,7 +21,7 @@ impl FmtProjectCommand {
         let vfs = Vfs::new_default()?;
         vfs.set_watch_enabled(false);
 
-        let base_path = resolve_path(&self.project)?;
+        let base_path = resolve_project_path(&self.project)?;
         let project = Project::load_fuzzy(&vfs, &base_path)?
             .context("A project file is required to run 'rojo fmt-project'")?;
 

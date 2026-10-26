@@ -19,6 +19,15 @@ use crate::{
 /// of an instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstanceMetadata {
+    /// Effective authority, distinct from the incoming context used when a
+    /// project is reloaded. Private protocol state; never grants client rights.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub effective_sync_authority: Option<Arc<crate::SyncAuthority>>,
+    /// Rule authority retained for reversible syncback; never sent on the wire.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub rule_defaults: Option<Box<crate::snapshot_middleware::RuleDefaultState>>,
     /// Whether instances not present in the source should be ignored when
     /// live-syncing. This is useful when there are instances that Rojo does not
     /// manage.
@@ -75,6 +84,8 @@ pub struct InstanceMetadata {
 impl InstanceMetadata {
     pub fn new() -> Self {
         Self {
+            effective_sync_authority: None,
+            rule_defaults: None,
             ignore_unknown_instances: false,
             instigating_source: None,
             relevant_paths: Vec::new(),
@@ -108,6 +119,9 @@ impl InstanceMetadata {
 
     pub fn context(self, context: &InstanceContext) -> Self {
         Self {
+            effective_sync_authority: context.sync_authority.clone(),
+            ignore_unknown_instances: self.ignore_unknown_instances
+                || context.ignore_unknown_descendants == Some(true),
             context: context.clone(),
             ..self
         }
@@ -140,6 +154,25 @@ impl Default for InstanceMetadata {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstanceContext {
+    /// Offline build/export sessions do not negotiate Studio authority.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub offline_session: bool,
+    /// Inherited project authority. Presence of an empty list ends inheritance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_authority: Option<Arc<crate::SyncAuthority>>,
+    /// Transient authority for one physical project binding.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub rule_owner: Option<Arc<crate::snapshot_middleware::RuleOwner>>,
+    /// Filter implicit physically empty directory trees without changing explicit bindings.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_empty_directories: bool,
+    /// Enable read-only directory aggregation for sourcemap sessions only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sourcemap_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_unknown_descendants: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub path_ignore_rules: Arc<Vec<PathIgnoreRule>>,
     pub emit_legacy_scripts: bool,
@@ -150,6 +183,12 @@ pub struct InstanceContext {
 impl InstanceContext {
     pub fn new() -> Self {
         Self {
+            offline_session: false,
+            sync_authority: None,
+            rule_owner: None,
+            ignore_empty_directories: false,
+            sourcemap_only: false,
+            ignore_unknown_descendants: None,
             path_ignore_rules: Arc::new(Vec::new()),
             emit_legacy_scripts: emit_legacy_scripts_default().unwrap(),
             sync_rules: Vec::new(),
@@ -165,7 +204,7 @@ impl InstanceContext {
         }
     }
 
-    /// Extend the list of ignore rules in the context with the given new rules.
+    /// Extend ignore rules, retaining the last occurrence of an identical rule.
     pub fn add_path_ignore_rules<I>(&mut self, new_rules: I)
     where
         I: IntoIterator<Item = PathIgnoreRule>,
@@ -179,8 +218,19 @@ impl InstanceContext {
             return;
         }
 
+        let new_rules: Vec<_> = new_rules.collect();
+        if self.path_ignore_rules.ends_with(&new_rules) {
+            return;
+        }
+
         let rules = Arc::make_mut(&mut self.path_ignore_rules);
-        rules.extend(new_rules);
+        for new_rule in new_rules {
+            // Ignore rules use last-match precedence, including negations.
+            // Skipping an already present rule would preserve the wrong
+            // priority; remove its earlier occurrences before appending it.
+            rules.retain(|existing| existing != &new_rule);
+            rules.push(new_rule);
+        }
     }
 
     /// Extend the list of syncing rules in the context with the given new rules.
@@ -203,7 +253,9 @@ impl InstanceContext {
     /// Returns the middleware specified by the first sync rule that
     /// matches the provided path. This does not handle default syncing rules.
     pub fn get_user_sync_rule(&self, path: &Path) -> Option<&SyncRule> {
-        self.sync_rules.iter().find(|&rule| rule.matches(path))
+        self.sync_rules
+            .iter()
+            .find(|&rule| rule.middleware.is_some() && rule.matches(path))
     }
 }
 
@@ -231,7 +283,13 @@ impl PathIgnoreRule {
 
         match path.strip_prefix(&self.base_path) {
             Ok(suffix) => self.glob.is_match(suffix),
-            Err(_) => false,
+            Err(_) => {
+                // An absolute $path may own sources outside the project folder.
+                // Keep the same ../ scope as a relative binding; different drives
+                // have no relative representation, but wildcard rules still apply.
+                let relative = pathdiff::diff_paths(path, &self.base_path);
+                self.glob.is_match(relative.as_deref().unwrap_or(path))
+            }
         }
     }
 
@@ -265,7 +323,7 @@ pub enum InstigatingSource {
         #[serde(serialize_with = "path_serializer::serialize_absolute")]
         path: PathBuf,
         name: String,
-        node: ProjectNode,
+        node: Box<ProjectNode>,
         parent_class: Option<String>,
     },
 }
@@ -315,6 +373,7 @@ impl From<&Path> for InstigatingSource {
 /// Represents an user-specified rule for transforming files
 /// into Instances using a given middleware.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(try_from = "UncheckedSyncRule")]
 pub struct SyncRule {
     /// A pattern used to determine if a file is included in this SyncRule
     #[serde(rename = "pattern")]
@@ -323,8 +382,10 @@ pub struct SyncRule {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude: Option<Glob>,
     /// The middleware specified by the user for this SyncRule
-    #[serde(rename = "use")]
-    pub middleware: Middleware,
+    #[serde(rename = "use", skip_serializing_if = "Option::is_none")]
+    pub middleware: Option<Middleware>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<Arc<crate::snapshot_middleware::RuleDefaults>>,
     /// A suffix to trim off of file names, including the file extension.
     /// If not specified, the file extension is the only thing cut off.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -333,6 +394,42 @@ pub struct SyncRule {
     /// relative to a path instead of absolute.
     #[serde(skip)]
     pub base_path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct UncheckedSyncRule {
+    pattern: Glob,
+    exclude: Option<Glob>,
+    #[serde(rename = "use")]
+    middleware: Option<Middleware>,
+    suffix: Option<String>,
+    defaults: Option<Arc<crate::snapshot_middleware::RuleDefaults>>,
+}
+
+impl TryFrom<UncheckedSyncRule> for SyncRule {
+    type Error = anyhow::Error;
+
+    fn try_from(rule: UncheckedSyncRule) -> Result<Self, Self::Error> {
+        anyhow::ensure!(
+            rule.middleware.is_some() || rule.defaults.as_ref().is_some_and(|d| !d.is_empty()),
+            "syncRules entry requires use or nonempty defaults"
+        );
+        anyhow::ensure!(
+            rule.middleware.is_some() || rule.suffix.is_none(),
+            "defaults-only syncRules entry cannot specify suffix"
+        );
+        if let Some(defaults) = &rule.defaults {
+            defaults.validate()?;
+        }
+        Ok(Self {
+            include: rule.pattern,
+            exclude: rule.exclude,
+            middleware: rule.middleware,
+            defaults: rule.defaults,
+            suffix: rule.suffix,
+            base_path: PathBuf::new(),
+        })
+    }
 }
 
 impl SyncRule {
@@ -369,6 +466,97 @@ impl SyncRule {
             path.file_stem()
                 .and_then(|s| s.to_str())
                 .with_context(|| format!("file name of {} is invalid", path.display()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod ignore_rule_tests {
+    use super::*;
+    use crate::glob::IgnorableGlob;
+
+    fn rule(base: &str, pattern: &str) -> PathIgnoreRule {
+        PathIgnoreRule {
+            base_path: base.into(),
+            glob: IgnorableGlob::new(pattern).unwrap(),
+        }
+    }
+
+    #[test]
+    fn repeated_ignore_blocks_do_not_accumulate_or_change_cloned_contexts() {
+        let block = vec![rule("/project", "**/*.lua"), rule("/project", "!keep.lua")];
+        let mut original = InstanceContext::new();
+        original.add_path_ignore_rules(block.clone());
+        let mut child = original.clone();
+        for _ in 0..1000 {
+            child.add_path_ignore_rules(block.clone());
+        }
+        assert_eq!(child.path_ignore_rules.len(), block.len());
+        assert_eq!(*child.path_ignore_rules, block);
+        assert_eq!(*original.path_ignore_rules, block);
+        assert!(is_path_ignored(
+            &child.path_ignore_rules,
+            "/project/drop.lua"
+        ));
+        assert!(!is_path_ignored(
+            &child.path_ignore_rules,
+            "/project/keep.lua"
+        ));
+    }
+
+    #[test]
+    fn duplicate_ignore_rules_retain_the_last_match_precedence_and_base_scope() {
+        let mut context = InstanceContext::new();
+        let positive = rule("/project", "**/*.lua");
+        let negative = rule("/project", "!keep.lua");
+        let other_base = rule("/elsewhere", "**/*.lua");
+        context.add_path_ignore_rules(vec![positive.clone(), negative.clone(), other_base.clone()]);
+        context.add_path_ignore_rules(vec![positive.clone(), positive.clone()]);
+        assert_eq!(context.path_ignore_rules.len(), 3);
+        assert_eq!(
+            *context.path_ignore_rules,
+            vec![negative.clone(), other_base.clone(), positive.clone()]
+        );
+        assert!(is_path_ignored(
+            &context.path_ignore_rules,
+            "/project/keep.lua"
+        ));
+        assert!(is_path_ignored(
+            &context.path_ignore_rules,
+            "/elsewhere/keep.lua"
+        ));
+        context.add_path_ignore_rules(vec![negative]);
+        assert!(!is_path_ignored(
+            &context.path_ignore_rules,
+            "/project/keep.lua"
+        ));
+        assert!(is_path_ignored(
+            &context.path_ignore_rules,
+            "/elsewhere/keep.lua"
+        ));
+        assert_eq!(context.path_ignore_rules.len(), 3);
+    }
+
+    #[test]
+    fn resnapshotting_a_project_with_its_saved_context_does_not_grow_ignore_rules() {
+        use crate::snapshot_middleware::snapshot_from_vfs;
+        use memofs::{InMemoryFs, Vfs, VfsSnapshot};
+
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot("/project", VfsSnapshot::dir([
+            ("default.project.json", VfsSnapshot::file(r#"{"name":"Root","globIgnorePaths":["**/*.ignored.lua"],"tree":{"$path":"src"}}"#)),
+            ("src", VfsSnapshot::dir([("main.lua", VfsSnapshot::file("return 1"))])),
+        ])).unwrap();
+        let vfs = Vfs::new(fs);
+        let mut context = InstanceContext::new();
+        for _ in 0..100 {
+            let snapshot =
+                snapshot_from_vfs(&context, &vfs, Path::new("/project/default.project.json"))
+                    .unwrap()
+                    .unwrap();
+            context = snapshot.metadata.context;
+            assert_eq!(context.path_ignore_rules.len(), 1);
+            assert_eq!(snapshot.children.len(), 1);
         }
     }
 }

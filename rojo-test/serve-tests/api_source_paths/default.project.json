@@ -1,0 +1,8 @@
+{
+  "name": "SourcePaths",
+  "tree": {
+    "$path": "src",
+    "Alias": { "$path": "src/script.luau" },
+    "Configured": { "$className": "Folder" }
+  }
+}

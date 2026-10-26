@@ -20,6 +20,11 @@ pub struct FsSnapshot {
 }
 
 impl FsSnapshot {
+    pub(crate) fn move_added_file(&mut self, from: &Path, to: PathBuf) {
+        if let Some(contents) = self.added_files.remove(from) {
+            self.added_files.insert(to, contents);
+        }
+    }
     /// Creates a new `FsSnapshot`.
     pub fn new() -> Self {
         Self {

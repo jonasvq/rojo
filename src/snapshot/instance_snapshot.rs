@@ -39,6 +39,18 @@ pub struct InstanceSnapshot {
 }
 
 impl InstanceSnapshot {
+    /// Model descendants have no filesystem source of their own, but must
+    /// receive the same preservation default as ordinary filesystem children.
+    pub(crate) fn inherit_model_context(&mut self, context: &super::InstanceContext) {
+        self.metadata.context.sync_authority = context.sync_authority.clone();
+        self.metadata.effective_sync_authority = context.sync_authority.clone();
+        self.metadata.ignore_unknown_instances = context.ignore_unknown_descendants == Some(true);
+        self.metadata.context.ignore_unknown_descendants = context.ignore_unknown_descendants;
+        for child in &mut self.children {
+            child.inherit_model_context(context);
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             snapshot_id: Ref::none(),

@@ -170,6 +170,14 @@ pub fn variant_eq(variant_a: &Variant, variant_b: &Variant) -> bool {
                 && approx_eq!(f32, a.y.scale, b.y.scale)
                 && a.y.offset == b.y.offset
         }
+        (Variant::TweenInfo(a), Variant::TweenInfo(b)) => {
+            approx_eq!(f32, a.time, b.time)
+                && approx_eq!(f32, a.delay_time, b.delay_time)
+                && a.easing_style == b.easing_style
+                && a.easing_direction == b.easing_direction
+                && a.repeat_count == b.repeat_count
+                && a.reverses == b.reverses
+        }
         (Variant::UniqueId(a), Variant::UniqueId(b)) => a == b,
         (Variant::String(a), Variant::String(b)) => a == b,
         (Variant::Vector2(a), Variant::Vector2(b)) => {
@@ -189,4 +197,31 @@ pub fn variant_eq(variant_a: &Variant, variant_b: &Variant) -> bool {
 #[inline(always)]
 fn vector_eq(a: &Vector3, b: &Vector3) -> bool {
     approx_eq!(f32, a.x, b.x) && approx_eq!(f32, a.y, b.y) && approx_eq!(f32, a.z, b.z)
+}
+
+#[cfg(test)]
+mod tweeninfo_tests {
+    use super::*;
+
+    #[test]
+    fn tweeninfo_compares_every_field_without_panicking() {
+        let value = serde_json::json!({"TweenInfo": {"time": 0.2, "delayTime": 0.1, "easingStyle": 3, "easingDirection": 0, "repeatCount": 2, "reverses": false}});
+        let original: Variant = serde_json::from_value(value.clone()).unwrap();
+        assert!(variant_eq(&original, &original));
+        for (field, changed) in [
+            ("time", serde_json::json!(0.3)),
+            ("delayTime", serde_json::json!(0.4)),
+            ("easingStyle", serde_json::json!(4)),
+            ("easingDirection", serde_json::json!(1)),
+            ("repeatCount", serde_json::json!(3)),
+            ("reverses", serde_json::json!(true)),
+        ] {
+            let mut edited = value.clone();
+            edited["TweenInfo"][field] = changed;
+            assert!(
+                !variant_eq(&original, &serde_json::from_value(edited).unwrap()),
+                "{field}"
+            );
+        }
+    }
 }

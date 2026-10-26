@@ -1,3 +1,5 @@
+mod authority_filter;
+mod class_filter;
 mod file_names;
 mod fs_snapshot;
 mod hash;
@@ -53,16 +55,63 @@ pub fn syncback_loop(
     mut new_tree: WeakDom,
     project: &Project,
 ) -> anyhow::Result<FsSnapshot> {
+    fn has_array(node: &crate::ProjectNode) -> bool {
+        matches!(node.path, Some(crate::PathNode::Multiple(_)))
+            || node.children.values().any(has_array)
+    }
+    anyhow::ensure!(
+        !has_array(&project.tree)
+            && !old_tree
+                .get_instance(old_tree.get_root_id())
+                .unwrap()
+                .metadata()
+                .context
+                .sourcemap_only,
+        "$path arrays and read-only sourcemap sessions cannot be used for syncback: {}",
+        project.file_location.display()
+    );
     let ignore_patterns = project
         .syncback_rules
         .as_ref()
         .map(|rules| rules.compile_globs())
         .transpose()?;
 
+    let mut class_protection = None;
+    if let Some(rules) = &project.syncback_rules {
+        if !rules.ignore_classes.is_empty() {
+            let (tree, protection) =
+                class_filter::apply(old_tree.inner(), new_tree, &rules.ignore_classes)
+                    .with_context(|| {
+                        format!(
+                            "Could not apply ignoreClasses in {}",
+                            project.file_location.display()
+                        )
+                    })?;
+            new_tree = tree;
+            class_protection = Some(protection);
+        }
+    }
+
+    // Exported file labels do not rename the configured project root.
+    new_tree.root_mut().name = old_tree.root().name().to_string();
+    let authority_projection = authority_filter::apply(old_tree, new_tree)?;
+    new_tree = authority_projection.tree;
+    let authority_protection = authority_projection.protection;
+    let authority_old = authority_projection.protected_old;
+    let native_authority = authority_projection.preserve_native_files;
+    let required_structure = authority_projection.required_structure;
+
     // TODO: Add a better way to tell if the root of a project is a directory
     let skip_pruning = if let Some(path) = &project.tree.path {
-        let middleware =
-            Middleware::middleware_for_path(vfs, &project.sync_rules, path.path()).unwrap();
+        let root_path = project.folder_location().join(path.path());
+        let middleware = Middleware::middleware_for_path(vfs, &project.sync_rules, &root_path)
+            .with_context(|| {
+                format!(
+                    "Failed to determine syncback middleware for {} in project {}",
+                    root_path.display(),
+                    project.file_location.display()
+                )
+            })?;
         if let Some(middleware) = middleware {
             middleware.is_dir()
         } else {
@@ -87,6 +136,15 @@ pub fn syncback_loop(
     // project file.
     log::debug!("Pre-filtering properties on DOMs");
     for referent in descendants(&new_tree, new_tree.root_ref()) {
+        if class_protection
+            .as_ref()
+            .is_some_and(|protection| protection.contains(referent))
+            || authority_protection
+                .as_ref()
+                .is_some_and(|protection| protection.contains(referent))
+        {
+            continue;
+        }
         let new_inst = new_tree.get_by_ref_mut(referent).unwrap();
         if let Some(filter) = get_property_filter(project, new_inst) {
             for prop in filter {
@@ -95,6 +153,13 @@ pub fn syncback_loop(
         }
     }
     for referent in descendants(old_tree.inner(), old_tree.get_root_id()) {
+        if class_protection
+            .as_ref()
+            .is_some_and(|protection| protection.contains(referent))
+            || authority_old.contains(&referent)
+        {
+            continue;
+        }
         let mut old_inst_rojo = old_tree.get_instance_mut(referent).unwrap();
         let old_inst = old_inst_rojo.inner_mut();
         if let Some(filter) = get_property_filter(project, old_inst) {
@@ -117,11 +182,22 @@ pub fn syncback_loop(
                 }
             }
             if let Some(Variant::Ref(camera_ref)) = camera_ref {
-                if new_tree.get_by_ref(*camera_ref).is_some() {
+                if new_tree.get_by_ref(*camera_ref).is_some()
+                    && !class_protection
+                        .as_ref()
+                        .is_some_and(|protection| protection.contains(*camera_ref))
+                {
                     new_tree.destroy(*camera_ref);
                 }
             }
         }
+    }
+
+    for (id, path) in required_structure {
+        anyhow::ensure!(
+            new_tree.get_by_ref(id).is_some(),
+            "syncAuthority filesystem structure was pruned by syncback normalization at {path}"
+        );
     }
 
     let ignore_referents = project
@@ -136,10 +212,17 @@ pub fn syncback_loop(
         log::debug!("Skipping referent linking as per project syncback rules");
     }
 
-    // As with pruning the children of the new root, we need to ensure the roots
-    // for both DOMs have the same name otherwise their hashes will always be
-    // different.
-    new_tree.root_mut().name = old_tree.root().name().to_string();
+    if let Some(protection) = &class_protection {
+        protection.finish_linking(&mut new_tree).with_context(|| {
+            format!(
+                "Could not preserve ignoreClasses references in {}",
+                project.file_location.display()
+            )
+        })?;
+    }
+    if let Some(protection) = &authority_protection {
+        protection.finish_linking(&mut new_tree)?;
+    }
 
     log::debug!("Hashing project DOM");
     let old_hashes = hash_tree(project, old_tree.inner(), old_tree.get_root_id());
@@ -252,7 +335,12 @@ pub fn syncback_loop(
                 syncback.removed_children.len()
             );
             'remove: for inst in &syncback.removed_children {
-                let path = inst.metadata().instigating_source.as_ref().unwrap().path();
+                let Some(source) = inst.metadata().instigating_source.as_ref() else {
+                    // Embedded model children have no separate file to delete.
+                    // Their container's middleware serializes the changed subtree.
+                    continue;
+                };
+                let path = source.path();
                 let inst_path = snapshot.get_old_inst_path(inst.id());
                 if !is_valid_path(&ignore_patterns, project_path, path) {
                     log::debug!(
@@ -279,9 +367,14 @@ pub fn syncback_loop(
 
         // TODO provide replacement snapshots for e.g. two way sync
 
-        fs_snapshot.merge_with_filter(syncback.fs_snapshot, |path| {
-            is_valid_path(&ignore_patterns, project_path, path)
-        });
+        // Native writers emit this node's body/metadata separately from child
+        // snapshots. A Studio-owned child change must not rewrite its parent's
+        // filesystem-owned bytes (for example normalizing a script's CRLF).
+        if middleware.handles_own_properties() || !native_authority.contains(&snapshot.new) {
+            fs_snapshot.merge_with_filter(syncback.fs_snapshot, |path| {
+                is_valid_path(&ignore_patterns, project_path, path)
+            });
+        }
 
         snapshots.extend(syncback.children);
     }
@@ -355,7 +448,24 @@ pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
         }
     }
 
-    if !inst.children().is_empty() {
+    // A source file named init would usurp its parent on the next build.
+    // Use the script's directory form even when it has no children, preserving
+    // its own name and class without changing the containing Folder.
+    let reserved_source_name = snapshot.old.is_none()
+        && matches!(
+            middleware,
+            Middleware::ServerScript
+                | Middleware::ClientScript
+                | Middleware::ModuleScript
+                | Middleware::PluginScript
+                | Middleware::Csv
+        )
+        && crate::snapshot_middleware::is_init_file_name(&format!(
+            "{}.{}",
+            inst.name,
+            extension_for_middleware(middleware)
+        ));
+    if !inst.children().is_empty() || reserved_source_name {
         middleware = match middleware {
             Middleware::ServerScript => Middleware::ServerScriptDir,
             Middleware::ClientScript => Middleware::ClientScriptDir,
@@ -381,6 +491,10 @@ pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SyncbackRules {
+    /// Classes (including derived classes) whose existing disk subtrees are
+    /// preserved rather than replaced by the input place.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ignore_classes: Vec<Ustr>,
     /// A list of subtrees in a file that will be ignored by Syncback.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ignore_trees: Vec<String>,
@@ -468,7 +582,7 @@ fn is_valid_path(globs: &Option<Vec<IgnorableGlob>>, base_path: &Path, path: &Pa
 /// It **does not** handle properties that should not serialize for other
 /// reasons, such as being defaults or being marked as not serializing in the
 /// ReflectionDatabase.
-fn get_property_filter(project: &Project, new_inst: &Instance) -> Option<UstrSet> {
+pub(crate) fn get_property_filter(project: &Project, new_inst: &Instance) -> Option<UstrSet> {
     let filter = &project.syncback_rules.as_ref()?.ignore_properties;
     let mut set = UstrSet::default();
 
@@ -549,8 +663,252 @@ fn strip_unknown_root_children(new: &mut WeakDom, old: &RojoTree) {
 mod test {
     use super::*;
 
+    #[test]
+    fn inaccessible_root_middleware_returns_contextual_error() {
+        use crate::{snapshot::InstanceContext, snapshot_middleware::snapshot_from_vfs};
+        use memofs::{InMemoryFs, NoopBackend, VfsSnapshot};
+        use rbx_dom_weak::InstanceBuilder;
+
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/project",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(r#"{"name":"Root","tree":{"$path":"src"}}"#),
+                ),
+                ("src", VfsSnapshot::empty_dir()),
+            ]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(fs);
+        vfs.set_watch_enabled(false);
+        let project_path = Path::new("/project/default.project.json");
+        let project = Project::load_initial_project(&vfs, project_path).unwrap();
+        let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, project_path)
+            .unwrap()
+            .unwrap();
+        let mut old = RojoTree::new(snapshot);
+        let new = WeakDom::new(InstanceBuilder::new("Folder").with_name("Root"));
+        let inaccessible_vfs = Vfs::new(NoopBackend::new());
+        let err = syncback_loop(&inaccessible_vfs, &mut old, new, &project)
+            .err()
+            .expect("an inaccessible source must fail syncback");
+        let message = format!("{err:#}");
+        assert!(message.contains("src"), "{message}");
+        assert!(message.contains("syncback"), "{message}");
+    }
+
+    #[test]
+    fn syncback_ignores_duplicate_unmapped_children_of_project_nodes() {
+        use crate::{snapshot::InstanceContext, snapshot_middleware::snapshot_from_vfs};
+        use memofs::{InMemoryFs, VfsSnapshot};
+        use rbx_dom_weak::InstanceBuilder;
+
+        for duplicate_name in ["Unmanaged", "Known", "MissingManaged"] {
+            let mut fs = InMemoryFs::new();
+            fs.load_snapshot(
+                "/project/default.project.json",
+                VfsSnapshot::file(
+                    br#"{
+                "name":"Root", "tree":{"$className":"DataModel", "Workspace":{
+                    "Known":{"$className":"StringValue","$properties":{"Value":"before"}}
+                }}
+            }"#
+                    .to_vec(),
+                ),
+            )
+            .unwrap();
+            let vfs = Vfs::new(fs);
+            vfs.set_watch_enabled(false);
+            let path = Path::new("/project/default.project.json");
+            let project = Project::load_initial_project(&vfs, path).unwrap();
+            let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, path)
+                .unwrap()
+                .unwrap();
+            let mut old = RojoTree::new(snapshot);
+            let mut workspace = InstanceBuilder::new("Workspace")
+                .with_child(InstanceBuilder::new("StringValue").with_name(duplicate_name))
+                .with_child(InstanceBuilder::new("StringValue").with_name(duplicate_name));
+            if duplicate_name != "MissingManaged" {
+                workspace = workspace.with_child(
+                    InstanceBuilder::new("StringValue")
+                        .with_name("Known")
+                        .with_property("Value", "after"),
+                );
+            }
+            let new = WeakDom::new(
+                InstanceBuilder::new("DataModel")
+                    .with_name("Root")
+                    .with_child(workspace),
+            );
+            let original_contents = vfs.read(path).unwrap();
+            let changes = syncback_loop(&vfs, &mut old, new, &project);
+            if duplicate_name != "Unmanaged" {
+                let error = changes
+                    .err()
+                    .expect("Ambiguous managed names must still fail");
+                let expected = if duplicate_name == "Known" {
+                    "duplicated"
+                } else {
+                    "present only"
+                };
+                assert!(error.to_string().contains(expected), "{error}");
+                assert_eq!(vfs.read(path).unwrap(), original_contents);
+                continue;
+            }
+            let changes = changes.expect("Unmapped duplicate children must not prevent syncback");
+            assert_eq!(changes.added_paths(), [path]);
+            assert!(changes.removed_paths().is_empty());
+            changes.write_to_vfs("/project", &vfs).unwrap();
+            let after = Project::load_initial_project(&vfs, path).unwrap();
+            let workspace = &after.tree.children["Workspace"];
+            assert_eq!(workspace.children.len(), 1);
+            let value = &workspace.children["Known"].properties[&ustr("Value")];
+            assert_eq!(serde_json::to_value(value).unwrap(), "after");
+        }
+    }
+
+    #[test]
+    fn adding_a_child_inside_a_mapped_service_only_rewrites_its_model() {
+        use crate::{snapshot::InstanceContext, snapshot_middleware::snapshot_from_vfs};
+        use memofs::{InMemoryFs, VfsSnapshot};
+        use rbx_dom_weak::InstanceBuilder;
+
+        for extension in ["rbxm", "rbxmx", "model.json"] {
+            let filename = format!("workspace.{extension}");
+            let model = WeakDom::new(
+                InstanceBuilder::new("Workspace")
+                    .with_child(InstanceBuilder::new("Folder").with_name("Retained")),
+            );
+            let mut contents = Vec::new();
+            match extension {
+                "rbxm" => rbx_binary::to_writer(&mut contents, &model, &[model.root_ref()]).unwrap(),
+                "rbxmx" => rbx_xml::to_writer(&mut contents, &model, &[model.root_ref()], rbx_xml::EncodeOptions::new()).unwrap(),
+                _ => contents.extend_from_slice(br#"{"className":"Workspace","children":[{"name":"Retained","className":"Folder"}]}"#),
+            }
+            let project_contents = serde_json::to_vec(&serde_json::json!({
+                "name": "Root", "tree": {"$className": "DataModel",
+                    "Workspace": {"$path": filename}}
+            }))
+            .unwrap();
+            let mut fs = InMemoryFs::new();
+            fs.load_snapshot(
+                "/project",
+                VfsSnapshot::dir([
+                    ("default.project.json", VfsSnapshot::file(project_contents)),
+                    (filename.as_str(), VfsSnapshot::file(contents)),
+                ]),
+            )
+            .unwrap();
+            let vfs = Vfs::new(fs);
+            vfs.set_watch_enabled(false);
+            let project_path = Path::new("/project/default.project.json");
+            let project = Project::load_initial_project(&vfs, project_path).unwrap();
+            let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, project_path)
+                .unwrap()
+                .unwrap();
+            let mut old = RojoTree::new(snapshot);
+            let new = WeakDom::new(
+                InstanceBuilder::new("DataModel")
+                    .with_name("Root")
+                    .with_child(
+                        InstanceBuilder::new("Workspace")
+                            .with_child(InstanceBuilder::new("Folder").with_name("Retained"))
+                            .with_child(InstanceBuilder::new("Part").with_name("Added")),
+                    ),
+            );
+            let changes = syncback_loop(&vfs, &mut old, new, &project).unwrap();
+            assert_eq!(
+                changes.added_paths(),
+                [Path::new("/project").join(&filename)],
+                "{extension}"
+            );
+            assert!(changes.removed_paths().is_empty(), "{extension}");
+            changes.write_to_vfs("/project", &vfs).unwrap();
+            let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, project_path)
+                .unwrap()
+                .unwrap();
+            let workspace = &snapshot.children[0];
+            assert_eq!(workspace.class_name, "Workspace");
+            assert_eq!(workspace.children.len(), 2, "{extension}");
+            assert!(workspace
+                .children
+                .iter()
+                .any(|child| child.name == "Added" && child.class_name == "Part"));
+            assert!(workspace
+                .children
+                .iter()
+                .any(|child| child.name == "Retained"));
+        }
+    }
+
+    #[test]
+    fn removing_a_child_inside_a_mapped_model_reserializes_its_container() {
+        use crate::{snapshot::InstanceContext, snapshot_middleware::snapshot_from_vfs};
+        use memofs::{InMemoryFs, VfsSnapshot};
+        use rbx_dom_weak::InstanceBuilder;
+
+        for extension in ["model.json", "rbxm", "rbxmx"] {
+            let filename = format!("model.{extension}");
+            let model = WeakDom::new(
+                InstanceBuilder::new("Folder")
+                    .with_name("Model")
+                    .with_child(InstanceBuilder::new("Folder").with_name("Removed"))
+                    .with_child(InstanceBuilder::new("Folder").with_name("Retained")),
+            );
+            let mut contents = Vec::new();
+            match extension {
+                "rbxm" => rbx_binary::to_writer(&mut contents, &model, &[model.root_ref()]).unwrap(),
+                "rbxmx" => rbx_xml::to_writer(
+                    &mut contents, &model, &[model.root_ref()], rbx_xml::EncodeOptions::new(),
+                ).unwrap(),
+                _ => contents.extend_from_slice(br#"{"className":"Folder","children":[{"name":"Removed","className":"Folder"},{"name":"Retained","className":"Folder"}]}"#),
+            }
+            let project_contents = serde_json::to_vec(&serde_json::json!({
+                "name": "Model", "tree": {"$path": filename},
+            }))
+            .unwrap();
+            let mut fs = InMemoryFs::new();
+            fs.load_snapshot(
+                "/project",
+                VfsSnapshot::dir([
+                    ("default.project.json", VfsSnapshot::file(project_contents)),
+                    (filename.as_str(), VfsSnapshot::file(contents)),
+                ]),
+            )
+            .unwrap();
+            let vfs = Vfs::new(fs);
+            vfs.set_watch_enabled(false);
+            let project_path = Path::new("/project/default.project.json");
+            let project = Project::load_initial_project(&vfs, project_path).unwrap();
+            let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, project_path)
+                .unwrap()
+                .unwrap();
+            let mut old = RojoTree::new(snapshot);
+            let new = WeakDom::new(
+                InstanceBuilder::new("Folder")
+                    .with_name("Model")
+                    .with_child(InstanceBuilder::new("Folder").with_name("Retained")),
+            );
+            let changes = syncback_loop(&vfs, &mut old, new, &project).unwrap();
+            assert!(changes.removed_paths().is_empty(), "{extension}");
+            assert_eq!(
+                changes.added_files(),
+                vec![Path::new("/project").join(&filename).as_path()]
+            );
+            changes.write_to_vfs("/project", &vfs).unwrap();
+            let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, project_path)
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.children.len(), 1, "{extension}");
+            assert_eq!(snapshot.children[0].name, "Retained", "{extension}");
+        }
+    }
+
     fn rules(ignore_paths: &[&str], create_ignore_dir_paths: Option<bool>) -> SyncbackRules {
         SyncbackRules {
+            ignore_classes: Vec::new(),
             ignore_trees: Vec::new(),
             ignore_paths: ignore_paths.iter().map(|s| s.to_string()).collect(),
             ignore_properties: IndexMap::new(),

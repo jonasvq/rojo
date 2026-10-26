@@ -1,23 +1,41 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     ffi::OsStr,
-    fs, io,
+    io,
     net::IpAddr,
     path::{Path, PathBuf},
 };
 
-use memofs::Vfs;
-use rbx_dom_weak::Ustr;
+use memofs::{IoResultExt as _, Vfs};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "cli")]
+use std::collections::BTreeMap;
 use thiserror::Error;
 
-use crate::{
-    glob::IgnorableGlob, json, resolution::UnresolvedValue, snapshot::SyncRule,
-    syncback::SyncbackRules,
+use crate::{glob::IgnorableGlob, json, snapshot::SyncRule, syncback::SyncbackRules};
+
+pub use rojo_project_types::{
+    ClassAuthorityPolicy, MultiplePaths, OptionalPathNode, PathNode, ProjectFormatVersion,
+    ProjectNode, PropertyAuthority, RuleDefaultMask, StructureAuthority, SyncAuthority,
 };
 
 /// Represents 'default' project names that act as `init` files
 pub static DEFAULT_PROJECT_NAMES: [&str; 2] = ["default.project.json", "default.project.jsonc"];
+
+/// Directory-entry aliases, active only with an explicit V2 declaration.
+pub static INIT_PROJECT_NAMES: [&str; 2] = ["init.project.json", "init.project.jsonc"];
+
+fn deserialize_format_version<'de, D>(
+    deserializer: D,
+) -> Result<Option<ProjectFormatVersion>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Only omission means legacy defaults; an explicit null is not a version.
+    ProjectFormatVersion::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("Invalid project $version: {error}")))
+}
 
 /// Error type returned by any function that handles projects.
 #[derive(Debug, Error)]
@@ -26,6 +44,8 @@ pub struct ProjectError(#[from] Error);
 
 #[derive(Debug, Error)]
 enum Error {
+    #[error("Ambiguous project directory entries: {paths}. Specify a project file explicitly or remove the conflicting entry.")]
+    AmbiguousEntries { paths: String },
     #[error(
         "Rojo requires a project file, but no project file was found in path {}\n\
         See https://rojo.space/docs/ for guides and documentation.",
@@ -62,6 +82,15 @@ enum Error {
 pub struct Project {
     #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
     schema: Option<String>,
+
+    /// Opt into versioned defaults without migrating source files.
+    #[serde(
+        rename = "$version",
+        default,
+        deserialize_with = "deserialize_format_version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub format_version: Option<ProjectFormatVersion>,
 
     /// The name of the top-level instance described by the project.
     pub name: Option<String>,
@@ -121,6 +150,10 @@ pub struct Project {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub emit_legacy_scripts: Option<bool>,
 
+    /// Omit implicit physically empty directory trees; nested projects inherit omission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore_empty_directories: Option<bool>,
+
     /// A list of globs, relative to the folder the project file is in, that
     /// match files that should be excluded if Rojo encounters them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -136,6 +169,15 @@ pub struct Project {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sync_rules: Vec<SyncRule>,
 
+    /// Replace inherited managed-write policies. An empty list restores legacy
+    /// authority; omission inherits the enclosing project's list.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_sync_authority",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sync_authority: Option<SyncAuthority>,
+
     /// The path to the file that this project came from. Relative paths in the
     /// project should be considered relative to the parent of this field, also
     /// given by `Project::folder_location`.
@@ -143,7 +185,20 @@ pub struct Project {
     pub file_location: PathBuf,
 }
 
+fn deserialize_sync_authority<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<SyncAuthority>, D::Error> {
+    SyncAuthority::deserialize(deserializer).map(Some)
+}
+
 impl Project {
+    pub(crate) fn effective_emit_legacy_scripts(&self) -> bool {
+        self.emit_legacy_scripts.unwrap_or_else(|| {
+            self.format_version != Some(ProjectFormatVersion::V2)
+                && crate::snapshot_middleware::emit_legacy_scripts_default().unwrap()
+        })
+    }
+
     /// Tells whether the given path describes a Rojo project.
     pub fn is_project_file(path: &Path) -> bool {
         path.file_name()
@@ -155,39 +210,76 @@ impl Project {
     /// Attempt to locate a project represented by the given path.
     ///
     /// This will find a project if the path refers to a `.project.json` file,
-    /// or is a folder that contains a `default.project.json` file.
-    fn locate(path: &Path) -> Option<PathBuf> {
-        let meta = fs::metadata(path).ok()?;
-
-        if meta.is_file() {
-            if Project::is_project_file(path) {
-                Some(path.to_path_buf())
-            } else {
-                None
+    /// or is a folder with a default project or explicit V2 init entry.
+    fn locate(vfs: &Vfs, path: &Path) -> Result<Option<PathBuf>, ProjectError> {
+        match vfs.metadata(path).with_not_found().map_err(Error::from)? {
+            Some(meta) if meta.is_dir() => Self::directory_entry(vfs, path),
+            Some(meta) if meta.is_file() && Self::is_project_file(path) => {
+                Ok(Some(path.to_owned()))
             }
-        } else {
-            for filename in DEFAULT_PROJECT_NAMES {
-                let child_path = path.join(filename);
-                let child_meta = fs::metadata(&child_path).ok()?;
+            _ => Ok(None),
+        }
+    }
 
-                if child_meta.is_file() {
-                    return Some(child_path);
+    pub(crate) fn directory_entry(vfs: &Vfs, path: &Path) -> Result<Option<PathBuf>, ProjectError> {
+        let exists = |candidate: &Path| {
+            vfs.metadata(candidate)
+                .with_not_found()
+                .map(|meta| meta.is_some())
+                .map_err(|error| Error::Io {
+                    source: io::Error::new(
+                        error.kind(),
+                        format!("Could not inspect {}: {error}", candidate.display()),
+                    ),
+                })
+        };
+        let mut defaults = Vec::new();
+        for name in DEFAULT_PROJECT_NAMES {
+            let candidate = path.join(name);
+            if exists(&candidate)? {
+                defaults.push(candidate);
+            }
+        }
+        let mut aliases = Vec::new();
+        for name in INIT_PROJECT_NAMES {
+            let candidate = path.join(name);
+            if exists(&candidate)?
+                && Self::load_exact(vfs, &candidate, Some("init"))?.format_version
+                    == Some(ProjectFormatVersion::V2)
+            {
+                aliases.push(candidate);
+            }
+        }
+        if !aliases.is_empty() {
+            let mut conflicts = aliases.clone();
+            conflicts.extend(defaults);
+            for (_, name) in crate::snapshot_middleware::INIT_PATHS {
+                let candidate = path.join(name);
+                if exists(&candidate)? {
+                    conflicts.push(candidate);
                 }
             }
-            // This is a folder with the same name as a Rojo default project
-            // file.
-            //
-            // That's pretty weird, but we can roll with it.
-            None
+            if conflicts.len() > 1 {
+                return Err(Error::AmbiguousEntries {
+                    paths: conflicts
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                }
+                .into());
+            }
+            Ok(aliases.pop())
+        } else {
+            Ok(defaults.into_iter().next())
         }
     }
 
     /// Sets the name of a project. The order it handles is as follows:
     ///
-    /// - If the project is a `default.project.json`, uses the folder's name
-    /// - If a fallback is specified, uses that blindly
-    /// - Otherwise, loops through sync rules (including the default ones!) and
-    ///   uses the name of the first one that matches and is a project file
+    /// - Default entries and V2 init entries use their containing folder's name.
+    /// - Otherwise, a supplied fallback wins.
+    /// - A directly loaded V1 init project uses its ordinary stem, `init`.
     fn set_file_name(&mut self, fallback: Option<&str>) -> Result<(), Error> {
         let file_name = self
             .file_location
@@ -197,23 +289,24 @@ impl Project {
                 path: self.file_location.clone(),
             })?;
 
-        // If you're editing this to be generic, make sure you also alter the
-        // snapshot middleware to support generic init paths.
-        for default_file_name in DEFAULT_PROJECT_NAMES {
-            if file_name == default_file_name {
-                let folder_name = self.folder_location().file_name().and_then(OsStr::to_str);
-                if let Some(folder_name) = folder_name {
-                    self.name = Some(folder_name.to_string());
-                    return Ok(());
-                } else {
-                    return Err(Error::FolderNameInvalid {
-                        path: self.file_location.clone(),
-                    });
-                }
+        let init_alias = INIT_PROJECT_NAMES.contains(&file_name);
+        if DEFAULT_PROJECT_NAMES.contains(&file_name)
+            || (init_alias && self.format_version == Some(ProjectFormatVersion::V2))
+        {
+            let folder_name = self.folder_location().file_name().and_then(OsStr::to_str);
+            if let Some(folder_name) = folder_name {
+                self.name = Some(folder_name.to_string());
+                return Ok(());
+            } else {
+                return Err(Error::FolderNameInvalid {
+                    path: self.file_location.clone(),
+                });
             }
         }
         if let Some(fallback) = fallback {
             self.name = Some(fallback.to_string());
+        } else if init_alias {
+            self.name = Some("init".to_owned());
         } else {
             // As of the time of writing (July 10, 2024) there is no way for
             // this code path to be reachable. It can in theory be reached from
@@ -231,6 +324,15 @@ impl Project {
 
     /// Loads a Project file from the provided contents with its source set as
     /// the provided location.
+    #[cfg(feature = "cli")]
+    pub(crate) fn from_stdin_bytes(
+        contents: &[u8],
+        origin: PathBuf,
+        name: &str,
+    ) -> Result<Self, ProjectError> {
+        Ok(Self::load_from_slice(contents, origin, Some(name))?)
+    }
+
     fn load_from_slice(
         contents: &[u8],
         project_file_location: PathBuf,
@@ -239,7 +341,7 @@ impl Project {
         let mut project: Self = json::from_slice(contents).map_err(|e| Error::Json {
             source: serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                e.to_string(),
+                format!("{e:#}"),
             )),
             path: project_file_location.clone(),
         })?;
@@ -254,12 +356,13 @@ impl Project {
 
     /// Loads a Project from a path. This will find the project if it refers to
     /// a `.project.json` file or if it refers to a directory that contains a
-    /// file named `default.project.json`.
+    /// default project or an explicit V2 init entry. Directory ambiguities are
+    /// rejected; explicitly naming a file bypasses directory selection.
     pub fn load_fuzzy(
         vfs: &Vfs,
         fuzzy_project_location: &Path,
     ) -> Result<Option<Self>, ProjectError> {
-        if let Some(project_path) = Self::locate(fuzzy_project_location) {
+        if let Some(project_path) = Self::locate(vfs, fuzzy_project_location)? {
             let contents = vfs.read(&project_path).map_err(|e| match e.kind() {
                 io::ErrorKind::NotFound => Error::NoProjectFound {
                     path: project_path.to_path_buf(),
@@ -298,16 +401,13 @@ impl Project {
         )?)
     }
 
+    #[cfg(any(feature = "cli", test))]
     pub(crate) fn load_initial_project(vfs: &Vfs, path: &Path) -> Result<Self, ProjectError> {
         if Self::is_project_file(path) {
             Self::load_exact(vfs, path, None)
         } else {
-            // Check for default projects.
-            for default_project_name in DEFAULT_PROJECT_NAMES {
-                let project_path = path.join(default_project_name);
-                if let Ok(true) = vfs.exists(&project_path) {
-                    return Self::load_exact(vfs, &project_path, None);
-                }
+            if let Some(project_path) = Self::directory_entry(vfs, path)? {
+                return Self::load_exact(vfs, &project_path, None);
             }
             Err(Error::NoProjectFound {
                 path: path.to_path_buf(),
@@ -319,7 +419,52 @@ impl Project {
     /// Checks if there are any compatibility issues with this project file and
     /// warns the user if there are any.
     fn check_compatibility(&self) {
-        self.tree.validate_reserved_names();
+        validate_reserved_names(&self.tree);
+    }
+
+    #[cfg(feature = "cli")]
+    pub(crate) fn warn_duplicate_paths(&self, vfs: &Vfs) {
+        fn visit(
+            node: &ProjectNode,
+            location: String,
+            folder: &Path,
+            vfs: &Vfs,
+            bindings: &mut BTreeMap<PathBuf, Vec<String>>,
+        ) {
+            if let Some(path) = &node.path {
+                // Canonicalization recognizes aliases without guessing whether
+                // a missing optional path will eventually refer to the same file.
+                for source in path.paths() {
+                    if let Ok(path) = vfs.canonicalize(folder.join(source)) {
+                        let locations = bindings.entry(path).or_default();
+                        if !locations.contains(&location) {
+                            locations.push(location.clone());
+                        }
+                    }
+                }
+            }
+            for (name, child) in &node.children {
+                visit(child, format!("{location}/{name}"), folder, vfs, bindings);
+            }
+        }
+
+        let mut bindings = BTreeMap::new();
+        visit(
+            &self.tree,
+            "tree".into(),
+            self.folder_location(),
+            vfs,
+            &mut bindings,
+        );
+        for (path, locations) in bindings {
+            if locations.len() > 1 {
+                log::warn!(
+                    "Duplicate $path binding in {}: {} is mapped at {}. \
+                     This produces separate instances; check whether these aliases are intentional.",
+                    self.file_location.display(), path.display(), locations.join(", ")
+                );
+            }
+        }
     }
 
     pub fn folder_location(&self) -> &Path {
@@ -327,125 +472,18 @@ impl Project {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct OptionalPathNode {
-    #[serde(serialize_with = "crate::path_serializer::serialize_absolute")]
-    pub optional: PathBuf,
-}
-
-impl OptionalPathNode {
-    pub fn new(optional: PathBuf) -> Self {
-        OptionalPathNode { optional }
-    }
-}
-
-/// Describes a path that is either optional or required
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum PathNode {
-    Required(#[serde(serialize_with = "crate::path_serializer::serialize_absolute")] PathBuf),
-    Optional(OptionalPathNode),
-}
-
-impl PathNode {
-    /// Returns the path of the `PathNode`, without regard for if it's optional
-    // or not.
-    #[inline]
-    pub fn path(&self) -> &Path {
-        match self {
-            PathNode::Required(pathbuf) => pathbuf,
-            PathNode::Optional(OptionalPathNode { optional }) => optional,
+fn validate_reserved_names(node: &ProjectNode) {
+    for (name, child) in &node.children {
+        if name.starts_with('$') {
+            log::warn!(
+                "Keys starting with '$' are reserved by Rojo to ensure forward compatibility."
+            );
+            log::warn!(
+                "This project uses the key '{}', which should be renamed.",
+                name
+            );
         }
-    }
-
-    /// Returns whether this `PathNode` is optional or not.
-    #[inline]
-    pub fn is_optional(&self) -> bool {
-        matches!(self, PathNode::Optional(_))
-    }
-}
-
-/// Describes an instance and its descendants in a project.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct ProjectNode {
-    /// If set, defines the ClassName of the described instance.
-    ///
-    /// `$className` MUST be set if `$path` is not set.
-    ///
-    /// `$className` CANNOT be set if `$path` is set and the instance described
-    /// by that path has a ClassName other than Folder.
-    #[serde(rename = "$className", skip_serializing_if = "Option::is_none")]
-    pub class_name: Option<Ustr>,
-
-    /// If set, defines an ID for the described Instance that can be used
-    /// to refer to it for the purpose of referent properties.
-    #[serde(rename = "$id", skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-
-    /// Contains all of the children of the described instance.
-    #[serde(flatten)]
-    pub children: BTreeMap<String, ProjectNode>,
-
-    /// The properties that will be assigned to the resulting instance.
-    ///
-    // TODO: Is this legal to set if $path is set?
-    #[serde(
-        rename = "$properties",
-        default,
-        skip_serializing_if = "BTreeMap::is_empty"
-    )]
-    pub properties: BTreeMap<Ustr, UnresolvedValue>,
-
-    #[serde(
-        rename = "$attributes",
-        default,
-        skip_serializing_if = "BTreeMap::is_empty"
-    )]
-    pub attributes: BTreeMap<String, UnresolvedValue>,
-
-    /// Defines the behavior when Rojo encounters unknown instances in Roblox
-    /// Studio during live sync. `$ignoreUnknownInstances` should be considered
-    /// a large hammer and used with care.
-    ///
-    /// If set to `true`, those instances will be left alone. This may cause
-    /// issues when files that turn into instances are removed while Rojo is not
-    /// running.
-    ///
-    /// If set to `false`, Rojo will destroy any instances it does not
-    /// recognize.
-    ///
-    /// If unset, its default value depends on other settings:
-    /// - If `$path` is not set, defaults to `true`
-    /// - If `$path` is set, defaults to `false`
-    #[serde(
-        rename = "$ignoreUnknownInstances",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub ignore_unknown_instances: Option<bool>,
-
-    /// Defines that this instance should come from the given file path. This
-    /// path can point to any file type supported by Rojo, including Lua files
-    /// (`.lua`), Roblox models (`.rbxm`, `.rbxmx`), and localization table
-    /// spreadsheets (`.csv`).
-    #[serde(rename = "$path", skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathNode>,
-}
-
-impl ProjectNode {
-    fn validate_reserved_names(&self) {
-        for (name, child) in &self.children {
-            if name.starts_with('$') {
-                log::warn!(
-                    "Keys starting with '$' are reserved by Rojo to ensure forward compatibility."
-                );
-                log::warn!(
-                    "This project uses the key '{}', which should be renamed.",
-                    name
-                );
-            }
-
-            child.validate_reserved_names();
-        }
+        validate_reserved_names(child);
     }
 }
 

@@ -7,12 +7,12 @@ local Log = require(Packages.Log)
 	A bidirectional map between instance IDs and Roblox instances. It lets us
 	keep track of every instance we know about.
 
-	TODO: Track ancestry to catch when stuff moves?
+	Topology notifications are separate from temporarily paused property writes.
 ]]
 local InstanceMap = {}
 InstanceMap.__index = InstanceMap
 
-function InstanceMap.new(onInstanceChanged)
+function InstanceMap.new(onInstanceChanged, onTopologyChanged)
 	local self = {
 		-- A map from IDs to instances.
 		fromIds = {},
@@ -31,6 +31,7 @@ function InstanceMap.new(onInstanceChanged)
 		-- Callback that's invoked whenever an instance is changed and it was
 		-- not paused.
 		onInstanceChanged = onInstanceChanged,
+		onTopologyChanged = onTopologyChanged,
 	}
 
 	return setmetatable(self, InstanceMap)
@@ -98,6 +99,19 @@ function InstanceMap:removeId(id)
 		self.fromIds[id] = nil
 		self.fromInstances[instance] = nil
 	end
+end
+
+function InstanceMap:hasLiveSignals(instance)
+	local signals = self.instancesToSignal[instance]
+	if typeof(signals) == "table" then
+		for _, signal in signals do
+			if signal.Connected then
+				return true
+			end
+		end
+		return false
+	end
+	return signals ~= nil and signals.Connected
 end
 
 function InstanceMap:removeInstance(instance)
@@ -179,6 +193,7 @@ function InstanceMap:__connectSignals(instance)
 	if instance:IsA("ValueBase") then
 		local signals = {
 			instance:GetPropertyChangedSignal("Name"):Connect(function()
+				self:__maybeFireTopologyChanged(instance)
 				self:__maybeFireInstanceChanged(instance, "Name")
 			end),
 
@@ -186,16 +201,36 @@ function InstanceMap:__connectSignals(instance)
 				self:__maybeFireInstanceChanged(instance, "Value")
 			end),
 
-			instance:GetPropertyChangedSignal("Parent"):Connect(function()
+			instance.AncestryChanged:Connect(function()
+				self:__maybeFireTopologyChanged(instance)
 				self:__maybeFireInstanceChanged(instance, "Parent")
 			end),
 		}
 
 		self.instancesToSignal[instance] = signals
 	else
-		self.instancesToSignal[instance] = instance.Changed:Connect(function(propertyName)
-			self:__maybeFireInstanceChanged(instance, propertyName)
-		end)
+		self.instancesToSignal[instance] = {
+			instance.Changed:Connect(function(propertyName)
+				if propertyName == "Name" then
+					self:__maybeFireTopologyChanged(instance)
+				end
+				if propertyName ~= "Parent" then
+					self:__maybeFireInstanceChanged(instance, propertyName)
+				end
+			end),
+			instance.AncestryChanged:Connect(function()
+				self:__maybeFireTopologyChanged(instance)
+				self:__maybeFireInstanceChanged(instance, "Parent")
+			end),
+		}
+	end
+end
+
+function InstanceMap:__maybeFireTopologyChanged(instance)
+	-- Property echo suppression must not hide later ancestry changes in Edit,
+	-- where RenderStepped may never clear pausedUpdateInstances.
+	if self.onTopologyChanged and not RunService:IsRunning() then
+		self.onTopologyChanged(instance)
 	end
 end
 

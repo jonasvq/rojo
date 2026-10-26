@@ -9,7 +9,6 @@ local Flipper = require(Packages.Flipper)
 
 local Assets = require(Plugin.Assets)
 local Theme = require(Plugin.App.Theme)
-local bindingUtil = require(Plugin.App.bindingUtil)
 
 local e = Roact.createElement
 
@@ -43,21 +42,37 @@ end
 local DomLabel = Roact.Component:extend("DomLabel")
 
 function DomLabel:init()
+	self.unmounted = false
 	local initHeight = self.props.elementHeight:getValue()
 	self.expanded = initHeight > 24
 
 	self.motor = Flipper.SingleMotor.new(initHeight)
-	self.binding = bindingUtil.fromMotor(self.motor)
+	local setBinding
+	self.binding, setBinding = Roact.createBinding(initHeight)
 
 	self:setState({
 		renderExpansion = self.expanded,
 	})
-	self.motor:onStep(function(value)
+	self.motorStepConnection = self.motor:onStep(function(value)
+		if self.unmounted then
+			return
+		end
+		setBinding(value)
+		if self.unmounted then
+			return
+		end
 		local renderExpansion = value > 24
 
 		self.props.setElementHeight(value)
+		if self.unmounted then
+			return
+		end
 		if self.props.updateEvent then
 			self.props.updateEvent:Fire()
+		end
+		-- The scroller may unmount this row while reacting to the new height.
+		if self.unmounted then
+			return
 		end
 
 		self:setState(function(state)
@@ -70,6 +85,12 @@ function DomLabel:init()
 			}
 		end)
 	end)
+end
+
+function DomLabel:willUnmount()
+	self.unmounted = true
+	self.motorStepConnection:disconnect()
+	self.motor:stop()
 end
 
 function DomLabel:didUpdate(prevProps)
@@ -165,6 +186,9 @@ function DomLabel:render()
 					elseif clickCount == 0 then
 						-- Single click expands the changes
 						task.wait(0.25)
+						if self.unmounted then
+							return
+						end
 						if os.clock() - (self.lastDoubleClickTime or 0) <= 0.25 then
 							-- This is a double click, so don't expand
 							return

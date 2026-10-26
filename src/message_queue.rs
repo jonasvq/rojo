@@ -9,6 +9,8 @@ use futures::channel::oneshot;
 pub struct MessageQueue<T> {
     messages: RwLock<Vec<T>>,
     message_listeners: Mutex<Vec<Listener<T>>>,
+    #[cfg(test)]
+    before_listener_lock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl<T: Clone> MessageQueue<T> {
@@ -16,6 +18,8 @@ impl<T: Clone> MessageQueue<T> {
         MessageQueue {
             messages: RwLock::new(Vec::new()),
             message_listeners: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            before_listener_lock: Mutex::new(None),
         }
     }
 
@@ -42,6 +46,14 @@ impl<T: Clone> MessageQueue<T> {
     pub fn subscribe(&self, cursor: u32) -> oneshot::Receiver<(u32, Vec<T>)> {
         let (sender, receiver) = oneshot::channel();
 
+        #[cfg(test)]
+        if let Some(hook) = self.before_listener_lock.lock().unwrap().take() {
+            hook();
+        }
+        // Match push_messages' lock order. Otherwise a push can occur between
+        // the empty-history check and registration and never wake this listener.
+        let mut message_listeners = self.message_listeners.lock().unwrap();
+
         let listener = {
             let listener = Listener { sender, cursor };
 
@@ -53,7 +65,6 @@ impl<T: Clone> MessageQueue<T> {
             }
         };
 
-        let mut message_listeners = self.message_listeners.lock().unwrap();
         message_listeners.push(listener);
 
         receiver
@@ -76,6 +87,34 @@ impl<T: Clone> MessageQueue<T> {
 
     pub fn cursor(&self) -> u32 {
         self.messages.read().unwrap().len() as u32
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::MessageQueue;
+    use std::{
+        sync::{mpsc, Arc},
+        thread,
+        time::Duration,
+    };
+
+    #[test]
+    fn subscribe_cannot_miss_a_message_before_listener_registration() {
+        let queue = Arc::new(MessageQueue::new());
+        let (before_lock, reached_lock) = mpsc::channel();
+        let (release_lock, proceed) = mpsc::channel();
+        *queue.before_listener_lock.lock().unwrap() = Some(Box::new(move || {
+            before_lock.send(()).unwrap();
+            proceed.recv_timeout(Duration::from_secs(2)).unwrap();
+        }));
+        let subscriber = Arc::clone(&queue);
+        let thread = thread::spawn(move || subscriber.subscribe(0));
+        reached_lock.recv_timeout(Duration::from_secs(2)).unwrap();
+        queue.push_messages(&[7]);
+        release_lock.send(()).unwrap();
+        let mut receiver = thread.join().unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), Some((1, vec![7])));
     }
 }
 

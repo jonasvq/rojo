@@ -19,7 +19,7 @@ use crate::{
     snapshot::{AppliedPatchSet, InstanceWithMeta, RojoTree},
 };
 
-use super::resolve_path;
+use super::resolve_project_path;
 
 const PATH_STRIP_FAILED_ERR: &str = "Failed to create relative paths for project file!";
 const ABSOLUTE_PATH_FAILED_ERR: &str = "Failed to turn relative path into absolute path!";
@@ -30,6 +30,11 @@ const ABSOLUTE_PATH_FAILED_ERR: &str = "Failed to turn relative path into absolu
 struct SourcemapNode<'a> {
     name: &'a str,
     class_name: Ustr,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_context_value: Option<u32>,
 
     #[serde(
         default,
@@ -68,18 +73,26 @@ pub struct SourcemapCommand {
     /// Whether the sourcemap should use absolute paths instead of relative paths.
     #[clap(long)]
     pub absolute: bool,
+
+    /// Make file paths relative to the output file's directory.
+    #[clap(long, requires = "output", conflicts_with = "absolute")]
+    pub relative_to_output: bool,
+
+    /// Include reflected RunContext names and raw values on Script nodes.
+    #[clap(long)]
+    pub include_run_context: bool,
 }
 
 impl SourcemapCommand {
     pub fn run(self) -> anyhow::Result<()> {
-        let project_path = dunce::canonicalize(resolve_path(&self.project)?)?;
+        let project_path = dunce::canonicalize(resolve_project_path(&self.project)?)?;
 
         log::trace!("Constructing filesystem with StdBackend");
         let vfs = Vfs::new_default()?;
         vfs.set_watch_enabled(self.watch);
 
         log::trace!("Setting up session for sourcemap generation");
-        let session = ServeSession::new(vfs, project_path)?;
+        let session = ServeSession::new_for_sourcemap(vfs, project_path)?;
         let mut cursor = session.message_queue().cursor();
 
         let filter = if self.include_non_scripts {
@@ -97,7 +110,14 @@ impl SourcemapCommand {
             .ok();
 
         log::trace!("Writing initial sourcemap");
-        write_sourcemap(&session, self.output.as_deref(), filter, self.absolute)?;
+        write_sourcemap(
+            &session,
+            self.output.as_deref(),
+            filter,
+            self.absolute,
+            self.relative_to_output,
+            self.include_run_context,
+        )?;
 
         if self.watch {
             log::trace!("Setting up runtime for watch mode");
@@ -113,8 +133,20 @@ impl SourcemapCommand {
                 };
                 cursor = new_cursor;
 
-                if patch_set_affects_sourcemap(&session, &patch_set, filter) {
-                    write_sourcemap(&session, self.output.as_deref(), filter, self.absolute)?;
+                if patch_set_affects_sourcemap(
+                    &session,
+                    &patch_set,
+                    filter,
+                    self.include_run_context,
+                ) {
+                    write_sourcemap(
+                        &session,
+                        self.output.as_deref(),
+                        filter,
+                        self.absolute,
+                        self.relative_to_output,
+                        self.include_run_context,
+                    )?;
                 }
             }
         }
@@ -142,6 +174,7 @@ fn patch_set_affects_sourcemap(
     session: &ServeSession,
     patch_set: &[AppliedPatchSet],
     filter: fn(&InstanceWithMeta) -> bool,
+    include_run_context: bool,
 ) -> bool {
     let tree = session.tree();
 
@@ -163,11 +196,13 @@ fn patch_set_affects_sourcemap(
                 let changed = updated.changed_class_name.is_some()
                     || updated.changed_name.is_some()
                     || updated.changed_metadata.is_some();
-                if changed {
+                let context_changed = include_run_context
+                    && updated.changed_properties.contains_key(&rbx_dom_weak::ustr("RunContext"));
+                if changed || context_changed {
                     let instance = tree
                         .get_instance(updated.id)
                         .expect("instance did not exist when updating sourcemap");
-                    filter(&instance)
+                    filter(&instance) && (changed || instance.class_name() == "Script")
                 } else {
                     false
                 }
@@ -181,6 +216,7 @@ fn recurse_create_node<'a>(
     project_dir: &Path,
     filter: fn(&InstanceWithMeta) -> bool,
     use_absolute_paths: bool,
+    include_run_context: bool,
 ) -> Option<SourcemapNode<'a>> {
     let instance = tree.get_instance(referent).expect("instance did not exist");
 
@@ -188,7 +224,14 @@ fn recurse_create_node<'a>(
         .children()
         .par_iter()
         .filter_map(|&child_id| {
-            recurse_create_node(tree, child_id, project_dir, filter, use_absolute_paths)
+            recurse_create_node(
+                tree,
+                child_id,
+                project_dir,
+                filter,
+                use_absolute_paths,
+                include_run_context,
+            )
         })
         .collect();
 
@@ -224,12 +267,50 @@ fn recurse_create_node<'a>(
         }
     };
 
+    let (run_context, run_context_value) = if include_run_context {
+        script_run_context(&instance)
+    } else {
+        (None, None)
+    };
     Some(SourcemapNode {
         name: instance.name(),
         class_name: instance.class_name(),
+        run_context,
+        run_context_value,
         file_paths: output_file_paths,
         children,
     })
+}
+
+fn script_run_context(instance: &InstanceWithMeta<'_>) -> (Option<String>, Option<u32>) {
+    use rbx_dom_weak::types::Variant;
+    if instance.class_name() != "Script" {
+        return (None, None);
+    }
+    let database = rbx_reflection_database::get().unwrap();
+    let value = instance
+        .properties()
+        .get(&rbx_dom_weak::ustr("RunContext"))
+        .or_else(|| {
+            database
+                .classes
+                .get("Script")?
+                .default_properties
+                .get("RunContext")
+        });
+    let Some(Variant::Enum(value)) = value else {
+        return (None, None);
+    };
+    let raw = value.to_u32();
+    let name = database.enums.get("RunContext").and_then(|context| {
+        context
+            .items
+            .iter()
+            .filter(|(_, value)| **value == raw)
+            .map(|(name, _)| name.to_string())
+            .min()
+    });
+    (name, Some(raw))
 }
 
 fn write_sourcemap(
@@ -237,15 +318,40 @@ fn write_sourcemap(
     output: Option<&Path>,
     filter: fn(&InstanceWithMeta) -> bool,
     use_absolute_paths: bool,
+    relative_to_output: bool,
+    include_run_context: bool,
 ) -> anyhow::Result<()> {
     let tree = session.tree();
+
+    let output_base;
+    let base = if relative_to_output {
+        anyhow::ensure!(
+            !use_absolute_paths,
+            "--relative-to-output conflicts with --absolute"
+        );
+        let output = output.context("--relative-to-output requires --output")?;
+        let parent = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        output_base = dunce::canonicalize(parent).with_context(|| {
+            format!(
+                "Could not resolve sourcemap output directory {}",
+                parent.display()
+            )
+        })?;
+        output_base.as_path()
+    } else {
+        session.root_dir()
+    };
 
     let root_node = recurse_create_node(
         &tree,
         tree.get_root_id(),
-        session.root_dir(),
+        base,
         filter,
         use_absolute_paths,
+        include_run_context,
     );
 
     if let Some(output_path) = output {
@@ -270,6 +376,194 @@ mod test {
     use std::path::Path;
 
     #[test]
+    fn run_context_names_raw_values_defaults_and_non_scripts_are_faithful() {
+        use crate::snapshot::{InstanceSnapshot, RojoTree};
+        use rbx_dom_weak::types::Enum;
+        for (raw, name) in [
+            (None, Some("Legacy")),
+            (Some(0), Some("Legacy")),
+            (Some(1), Some("Server")),
+            (Some(2), Some("Client")),
+            (Some(3), Some("Plugin")),
+            (Some(u32::MAX), None),
+        ] {
+            for class in ["Script", "LocalScript", "ModuleScript", "Folder"] {
+                let mut snapshot = InstanceSnapshot::new().name("Node").class_name(class);
+                if let Some(raw) = raw {
+                    snapshot = snapshot.property("RunContext", Enum::from_u32(raw));
+                }
+                let tree = RojoTree::new(snapshot);
+                for enabled in [false, true] {
+                    let node = super::recurse_create_node(
+                        &tree,
+                        tree.get_root_id(),
+                        Path::new("/project"),
+                        super::filter_nothing,
+                        false,
+                        enabled,
+                    )
+                    .unwrap();
+                    let value = serde_json::to_value(node).unwrap();
+                    if enabled && class == "Script" {
+                        assert_eq!(value["runContextValue"], raw.unwrap_or(0));
+                        assert_eq!(value["runContext"].as_str(), name);
+                    } else {
+                        assert!(value.get("runContext").is_none());
+                        assert!(value.get("runContextValue").is_none());
+                    }
+                    assert_eq!(value["className"], class);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn output_relative_cli_requires_output_and_rejects_absolute() {
+        use clap::Parser;
+        assert!(SourcemapCommand::try_parse_from(["sourcemap", "--relative-to-output"]).is_err());
+        assert!(SourcemapCommand::try_parse_from([
+            "sourcemap",
+            "--relative-to-output",
+            "--output",
+            "map.json",
+            "--absolute"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn output_relative_reports_missing_parent_without_creating_output() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("default.project.json");
+        fs_err::write(
+            &project,
+            r#"{"name":"Root","tree":{"$className":"Folder"}}"#,
+        )
+        .unwrap();
+        let output = dir.path().join("missing/sourcemap.json");
+        let command = SourcemapCommand::try_parse_from([
+            "sourcemap",
+            project.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--relative-to-output",
+        ])
+        .unwrap();
+        let error = command.run().unwrap_err().to_string();
+        assert!(
+            error.contains("sourcemap output directory") && error.contains("missing"),
+            "{error}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn maps_paths_relative_to_output_only_when_requested() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        fs_err::create_dir(dir.path().join("src")).unwrap();
+        fs_err::create_dir(dir.path().join("maps")).unwrap();
+        fs_err::write(dir.path().join("src/client.client.luau"), "print('client')").unwrap();
+        let project = dir.path().join("default.project.json");
+        fs_err::write(&project, r#"{"name":"Root","tree":{"$path":"src"}}"#).unwrap();
+        let output = dir.path().join("maps/sourcemap.json");
+        let command = SourcemapCommand::try_parse_from([
+            "sourcemap",
+            project.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--relative-to-output",
+        ])
+        .unwrap();
+        command.run().unwrap();
+        let map: serde_json::Value =
+            serde_json::from_str(&fs_err::read_to_string(output).unwrap()).unwrap();
+        assert_eq!(
+            map["children"][0]["filePaths"][0],
+            "../src/client.client.luau"
+        );
+    }
+
+    #[test]
+    fn exposes_client_run_context_without_changing_script_class() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        fs_err::write(dir.path().join("client.client.luau"), "print('client')").unwrap();
+        let project = dir.path().join("default.project.json");
+        fs_err::write(
+            &project,
+            r#"{"name":"Client","emitLegacyScripts":false,"tree":{"$path":"client.client.luau"}}"#,
+        )
+        .unwrap();
+        let output = dir.path().join("sourcemap.json");
+        let command = SourcemapCommand::try_parse_from([
+            "sourcemap",
+            project.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--include-run-context",
+        ])
+        .unwrap();
+        command.run().unwrap();
+        let map: serde_json::Value =
+            serde_json::from_str(&fs_err::read_to_string(output).unwrap()).unwrap();
+        assert_eq!(map["className"], "Script");
+        assert_eq!(map["runContext"], "Client");
+        assert_eq!(map["runContextValue"], 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn maps_cross_drive_sources_without_panicking_or_changing_relative_paths() {
+        use crate::snapshot::{InstanceMetadata, InstanceSnapshot, RojoTree};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("shared.luau");
+        fs_err::write(&source, "return 1").unwrap();
+        let tree = RojoTree::new(
+            InstanceSnapshot::new()
+                .name("Shared")
+                .class_name("ModuleScript")
+                .metadata(InstanceMetadata::new().relevant_paths(vec![source.clone()])),
+        );
+        let cross_drive = if source.starts_with("Z:\\") {
+            Path::new("Y:\\project")
+        } else {
+            Path::new("Z:\\project")
+        };
+        let cross = super::recurse_create_node(
+            &tree,
+            tree.get_root_id(),
+            cross_drive,
+            super::filter_nothing,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(cross.file_paths[0].as_ref(), source);
+        let same = super::recurse_create_node(
+            &tree,
+            tree.get_root_id(),
+            &dir.path().join("project"),
+            super::filter_nothing,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(same.file_paths[0].as_ref(), Path::new("../shared.luau"));
+        let absolute = super::recurse_create_node(
+            &tree,
+            tree.get_root_id(),
+            cross_drive,
+            super::filter_nothing,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(absolute.file_paths[0].as_ref(), source);
+    }
+
+    #[test]
     fn maps_relative_paths() {
         let sourcemap_dir = tempfile::tempdir().unwrap();
         let sourcemap_output = sourcemap_dir.path().join("sourcemap.json");
@@ -286,6 +580,8 @@ mod test {
             include_non_scripts: false,
             watch: false,
             absolute: false,
+            relative_to_output: false,
+            include_run_context: false,
         };
         assert!(sourcemap_command.run().is_ok());
 
@@ -312,6 +608,8 @@ mod test {
             include_non_scripts: false,
             watch: false,
             absolute: true,
+            relative_to_output: false,
+            include_run_context: false,
         };
         assert!(sourcemap_command.run().is_ok());
 

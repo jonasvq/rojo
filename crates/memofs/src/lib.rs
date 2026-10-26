@@ -150,7 +150,7 @@ struct VfsInner {
 impl VfsInner {
     fn read<P: AsRef<Path>>(&mut self, path: P) -> io::Result<Arc<Vec<u8>>> {
         let path = path.as_ref();
-        let contents = self.backend.read(path)?;
+        let contents = trace_io("read", path, self.backend.read(path))?;
 
         if self.watch_enabled {
             self.backend.watch(path)?;
@@ -161,7 +161,7 @@ impl VfsInner {
 
     fn read_to_string<P: AsRef<Path>>(&mut self, path: P) -> io::Result<Arc<String>> {
         let path = path.as_ref();
-        let contents = self.backend.read(path)?;
+        let contents = trace_io("read_to_string", path, self.backend.read(path))?;
 
         if self.watch_enabled {
             self.backend.watch(path)?;
@@ -179,18 +179,18 @@ impl VfsInner {
 
     fn exists<P: AsRef<Path>>(&mut self, path: P) -> io::Result<bool> {
         let path = path.as_ref();
-        self.backend.exists(path)
+        trace_io("exists", path, self.backend.exists(path))
     }
 
     fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&mut self, path: P, contents: C) -> io::Result<()> {
         let path = path.as_ref();
         let contents = contents.as_ref();
-        self.backend.write(path, contents)
+        trace_io("write", path, self.backend.write(path, contents))
     }
 
     fn read_dir<P: AsRef<Path>>(&mut self, path: P) -> io::Result<ReadDir> {
         let path = path.as_ref();
-        let dir = self.backend.read_dir(path)?;
+        let dir = trace_io("read_dir", path, self.backend.read_dir(path))?;
 
         if self.watch_enabled {
             self.backend.watch(path)?;
@@ -201,34 +201,34 @@ impl VfsInner {
 
     fn create_dir<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let path = path.as_ref();
-        self.backend.create_dir(path)
+        trace_io("create_dir", path, self.backend.create_dir(path))
     }
 
     fn create_dir_all<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let path = path.as_ref();
-        self.backend.create_dir_all(path)
+        trace_io("create_dir_all", path, self.backend.create_dir_all(path))
     }
 
     fn remove_file<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let path = path.as_ref();
         let _ = self.backend.unwatch(path);
-        self.backend.remove_file(path)
+        trace_io("remove_file", path, self.backend.remove_file(path))
     }
 
     fn remove_dir_all<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let path = path.as_ref();
         let _ = self.backend.unwatch(path);
-        self.backend.remove_dir_all(path)
+        trace_io("remove_dir_all", path, self.backend.remove_dir_all(path))
     }
 
     fn metadata<P: AsRef<Path>>(&mut self, path: P) -> io::Result<Metadata> {
         let path = path.as_ref();
-        self.backend.metadata(path)
+        trace_io("metadata", path, self.backend.metadata(path))
     }
 
     fn canonicalize<P: AsRef<Path>>(&mut self, path: P) -> io::Result<PathBuf> {
         let path = path.as_ref();
-        self.backend.canonicalize(path)
+        trace_io("canonicalize", path, self.backend.canonicalize(path))
     }
 
     fn event_receiver(&self) -> crossbeam_channel::Receiver<VfsEvent> {
@@ -236,12 +236,27 @@ impl VfsInner {
     }
 
     fn commit_event(&mut self, event: &VfsEvent) -> io::Result<()> {
+        log::trace!("commit_event: {:?}", event);
         if let VfsEvent::Remove(path) = event {
             let _ = self.backend.unwatch(path);
         }
 
         Ok(())
     }
+}
+
+fn trace_io<T>(operation: &str, path: &Path, result: io::Result<T>) -> io::Result<T> {
+    match &result {
+        Ok(_) => log::trace!("{} {}: ok", operation, path.display()),
+        Err(err) => log::debug!(
+            "{} {}: {} ({:?})",
+            operation,
+            path.display(),
+            err,
+            err.kind()
+        ),
+    }
+    result
 }
 
 /// A virtual filesystem with a configurable backend.
@@ -587,6 +602,140 @@ mod test {
     use crate::{InMemoryFs, StdBackend, Vfs, VfsSnapshot};
     use std::io;
     use std::path::PathBuf;
+
+    #[test]
+    fn removals_unlink_parent_entries_and_allow_clean_recreation() {
+        for in_memory in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let vfs = if in_memory {
+                Vfs::new(InMemoryFs::new())
+            } else {
+                Vfs::new(StdBackend::new().unwrap())
+            };
+            vfs.set_watch_enabled(false);
+            vfs.create_dir_all(dir.path()).unwrap();
+            vfs.write(dir.path().join("kept"), b"original").unwrap();
+            let names = || {
+                let mut names: Vec<_> = vfs
+                    .read_dir(dir.path())
+                    .unwrap()
+                    .map(|entry| {
+                        entry
+                            .unwrap()
+                            .path()
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
+                names.sort();
+                names
+            };
+            for _ in 0..2 {
+                vfs.write(dir.path().join("removed"), b"temporary").unwrap();
+                vfs.remove_file(dir.path().join("removed")).unwrap();
+                assert_eq!(names(), ["kept"], "in_memory={in_memory}");
+                assert!(vfs.read(dir.path().join("removed")).is_err());
+                vfs.create_dir_all(dir.path().join("gone/nested")).unwrap();
+                vfs.write(dir.path().join("gone/nested/child"), b"temporary")
+                    .unwrap();
+                vfs.remove_dir_all(dir.path().join("gone")).unwrap();
+                assert_eq!(names(), ["kept"], "in_memory={in_memory}");
+                assert!(vfs
+                    .exists(dir.path().join("gone/nested/child"))
+                    .is_ok_and(|exists| !exists));
+                assert_eq!(&*vfs.read(dir.path().join("kept")).unwrap(), b"original");
+            }
+            assert!(vfs.remove_file(dir.path().join("absent")).is_err());
+            assert!(vfs.remove_dir_all(dir.path().join("kept")).is_err());
+            assert_eq!(names(), ["kept"]);
+        }
+    }
+
+    #[test]
+    fn create_dir_all_preserves_existing_directory_contents() {
+        for in_memory in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("existing")).unwrap();
+            std::fs::write(dir.path().join("existing/kept.txt"), "kept").unwrap();
+            std::fs::write(dir.path().join("sibling.txt"), "sibling").unwrap();
+            let vfs = if in_memory {
+                let mut fs = InMemoryFs::new();
+                fs.load_snapshot(
+                    dir.path(),
+                    VfsSnapshot::dir([
+                        (
+                            "existing",
+                            VfsSnapshot::dir([("kept.txt", VfsSnapshot::file("kept"))]),
+                        ),
+                        ("sibling.txt", VfsSnapshot::file("sibling")),
+                    ]),
+                )
+                .unwrap();
+                Vfs::new(fs)
+            } else {
+                Vfs::new(StdBackend::new().unwrap())
+            };
+            vfs.set_watch_enabled(false);
+            for path in ["existing", "new/leaf", "new/leaf", "existing/deep/leaf"] {
+                vfs.create_dir_all(dir.path().join(path)).unwrap();
+                let names: Vec<_> = vfs
+                    .read_dir(dir.path().join("existing"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path().file_name().unwrap().to_owned())
+                    .collect();
+                assert!(
+                    names.iter().any(|name| name == "kept.txt"),
+                    "in_memory={}, path={}",
+                    in_memory,
+                    path
+                );
+                assert_eq!(
+                    &*vfs.read(dir.path().join("existing/kept.txt")).unwrap(),
+                    b"kept"
+                );
+                let names: Vec<_> = vfs
+                    .read_dir(dir.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path().file_name().unwrap().to_owned())
+                    .collect();
+                assert!(
+                    names.iter().any(|name| name == "sibling.txt"),
+                    "in_memory={}, path={}",
+                    in_memory,
+                    path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn create_dir_all_rejects_file_collisions_without_mutating_files() {
+        for in_memory in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("blocked"), "original").unwrap();
+            let vfs = if in_memory {
+                let mut fs = InMemoryFs::new();
+                fs.load_snapshot(
+                    dir.path(),
+                    VfsSnapshot::dir([("blocked", VfsSnapshot::file("original"))]),
+                )
+                .unwrap();
+                Vfs::new(fs)
+            } else {
+                Vfs::new(StdBackend::new().unwrap())
+            };
+            vfs.set_watch_enabled(false);
+            for path in ["blocked", "blocked/child/leaf"] {
+                vfs.create_dir_all(dir.path().join(path)).unwrap_err();
+                assert_eq!(&*vfs.read(dir.path().join("blocked")).unwrap(), b"original");
+                assert!(!vfs
+                    .exists(dir.path().join("blocked/child"))
+                    .unwrap_or(false));
+            }
+        }
+    }
 
     /// https://github.com/rojo-rbx/rojo/issues/899
     #[test]

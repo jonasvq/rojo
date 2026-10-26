@@ -26,6 +26,10 @@ local soundPlayer = require(Plugin.soundPlayer)
 local ignorePlaceIds = require(Plugin.ignorePlaceIds)
 local timeUtil = require(Plugin.timeUtil)
 local Theme = require(script.Theme)
+local Headless = require(Plugin.Headless)
+local HeadlessBridge = require(Plugin.HeadlessBridge)
+local HeadlessPanel = require(script.Components.HeadlessPanel)
+local OpenLaunch = require(Plugin.OpenLaunch)
 
 local Page = require(script.Page)
 local Notifications = require(script.Components.Notifications)
@@ -136,6 +140,16 @@ function App:init()
 		notifications = {},
 		toolbarIcon = Assets.Images.PluginButton,
 	})
+	self.headlessBridge = HeadlessBridge.new(self)
+	self.headless = Headless.new({
+		bridge = self.headlessBridge,
+		notify = function(options)
+			return self:addNotification(options)
+		end,
+		onStateChanged = function(state)
+			self:setState({ headlessAccess = state })
+		end,
+	})
 
 	if RunService:IsEdit() then
 		self:checkForUpdates()
@@ -149,11 +163,22 @@ function App:init()
 			end
 		end)
 
-		self:tryAutoReconnect():andThen(function(didReconnect)
-			if not didReconnect then
-				self:checkSyncReminder()
-			end
-		end)
+		local launch, launchError = OpenLaunch.consume()
+		if launch then
+			self.__openLaunch = launch
+			self.setHost(launch.host)
+			self.setPort(tostring(launch.port))
+			self:startSession()
+		elseif launchError then
+			Log.warn("Could not use rojo open launch: {}", launchError)
+			self:addNotification({ text = launchError, timeout = 10 })
+		else
+			self:tryAutoReconnect():andThen(function(didReconnect)
+				if not didReconnect then
+					self:checkSyncReminder()
+				end
+			end)
+		end
 	end
 
 	if self:isAutoConnectPlaytestServerAvailable() then
@@ -174,6 +199,8 @@ function App:init()
 end
 
 function App:willUnmount()
+	self.headless:destroy()
+	self.headlessBridge:destroy()
 	self:endSession()
 
 	self.waypointConnection:Disconnect()
@@ -601,6 +628,11 @@ function App:useRunningConnectionInfo()
 end
 
 function App:startSession()
+	local openLaunch = self.__openLaunch
+	self.__openLaunch = nil
+	if self.serveSession ~= nil then
+		return
+	end
 	local claimedLock, priorOwner = self:claimSyncLock()
 	if not claimedLock then
 		local msg = string.format("Could not sync because user '%s' is already syncing", tostring(priorOwner))
@@ -625,10 +657,18 @@ function App:startSession()
 		then string.format("%s:%s", host, port)
 		else string.format("http://%s:%s", host, port)
 	local apiContext = ApiContext.new(baseUrl)
+	if openLaunch then
+		apiContext.__expectedSessionId = openLaunch.sessionId
+	end
 
 	local serveSession = ServeSession.new({
 		apiContext = apiContext,
 		twoWaySync = Settings:get("twoWaySync"),
+		beforeHydrate = function(info, instances)
+			if self.headless then
+				self.headless:beforeHydrate(info, instances)
+			end
+		end,
 	})
 
 	serveSession:setUpdateLoadingTextCallback(function(text: string)
@@ -638,6 +678,9 @@ function App:startSession()
 	end)
 
 	self.cleanupPrecommit = serveSession:hookPrecommit(function(patch, instanceMap)
+		if self.headless then
+			self.headless:beforePatch(patch, instanceMap)
+		end
 		-- Build new tree for patch
 		self:setState({
 			patchTree = PatchTree.build(patch, instanceMap, { "Property", "Old", "New" }),
@@ -701,6 +744,10 @@ function App:startSession()
 			})
 		elseif status == ServeSession.Status.Disconnected then
 			self.serveSession = nil
+			if self.headless then
+				self.headless.projectOwnsNamespace = false
+				self.headless:publish()
+			end
 			self:releaseSyncLock()
 			self:clearRunningConnectionInfo()
 			self:setState({
@@ -736,71 +783,75 @@ function App:startSession()
 				})
 			end
 		end
+		if self.headlessBridge then
+			self.headlessBridge:refresh(details)
+		end
 	end)
 
 	serveSession:setConfirmCallback(function(instanceMap, patch, serverInfo)
-		if PatchSet.isEmpty(patch) then
-			Log.trace("Accepting patch without confirmation because it is empty")
-			return "Accept"
-		end
-
-		-- Play solo auto-connect does not require confirmation
-		if self:isAutoConnectPlaytestServerAvailable() then
-			Log.trace("Accepting patch without confirmation because play solo auto-connect is enabled")
-			return "Accept"
-		end
-
-		local confirmationBehavior = Settings:get("confirmationBehavior")
-		if confirmationBehavior == "Initial" then
-			-- Only confirm if we haven't synced this project yet this session
-			if self.knownProjects[serverInfo.projectName] then
-				Log.trace(
-					"Accepting patch without confirmation because project has already been connected and behavior is set to Initial"
-				)
+		if not openLaunch and not serverInfo.sourceWriteReview and not serverInfo.classAuthorityReview then
+			if PatchSet.isEmpty(patch) then
+				Log.trace("Accepting patch without confirmation because it is empty")
 				return "Accept"
 			end
-		elseif confirmationBehavior == "Large Changes" then
-			-- Only confirm if the patch impacts many instances
-			if PatchSet.countInstances(patch) < Settings:get("largeChangesConfirmationThreshold") then
-				Log.trace(
-					"Accepting patch without confirmation because patch is small and behavior is set to Large Changes"
-				)
+
+			-- Play solo auto-connect does not require confirmation
+			if self:isAutoConnectPlaytestServerAvailable() then
+				Log.trace("Accepting patch without confirmation because play solo auto-connect is enabled")
 				return "Accept"
 			end
-		elseif confirmationBehavior == "Unlisted PlaceId" then
-			-- Only confirm if the current placeId is not in the servePlaceIds allowlist
-			if serverInfo.expectedPlaceIds then
-				local isListed = table.find(serverInfo.expectedPlaceIds, game.PlaceId) ~= nil
-				if isListed then
+
+			local confirmationBehavior = Settings:get("confirmationBehavior")
+			if confirmationBehavior == "Initial" then
+				-- Only confirm if we haven't synced this project yet this session
+				if self.knownProjects[serverInfo.projectName] then
 					Log.trace(
-						"Accepting patch without confirmation because placeId is listed and behavior is set to Unlisted PlaceId"
+						"Accepting patch without confirmation because project has already been connected and behavior is set to Initial"
 					)
 					return "Accept"
 				end
-			end
-		elseif confirmationBehavior == "Never" then
-			Log.trace("Accepting patch without confirmation because behavior is set to Never")
-			return "Accept"
-		end
-
-		-- The datamodel name gets overwritten by Studio, making confirmation of it intrusive
-		-- and unnecessary. This special case allows it to be accepted without confirmation.
-		if
-			PatchSet.hasAdditions(patch) == false
-			and PatchSet.hasRemoves(patch) == false
-			and PatchSet.containsOnlyInstance(patch, instanceMap, game)
-		then
-			local datamodelUpdates = PatchSet.getUpdateForInstance(patch, instanceMap, game)
-			if
-				datamodelUpdates ~= nil
-				and next(datamodelUpdates.changedProperties) == nil
-				and datamodelUpdates.changedClassName == nil
-			then
-				Log.trace("Accepting patch without confirmation because it only contains a datamodel name change")
+			elseif confirmationBehavior == "Large Changes" then
+				-- Only confirm if the patch impacts many instances
+				if PatchSet.countInstances(patch) < Settings:get("largeChangesConfirmationThreshold") then
+					Log.trace(
+						"Accepting patch without confirmation because patch is small and behavior is set to Large Changes"
+					)
+					return "Accept"
+				end
+			elseif confirmationBehavior == "Unlisted PlaceId" then
+				-- Only confirm if the current placeId is not in the servePlaceIds allowlist
+				if serverInfo.expectedPlaceIds then
+					local isListed = table.find(serverInfo.expectedPlaceIds, game.PlaceId) ~= nil
+					if isListed then
+						Log.trace(
+							"Accepting patch without confirmation because placeId is listed and behavior is set to Unlisted PlaceId"
+						)
+						return "Accept"
+					end
+				end
+			elseif confirmationBehavior == "Never" then
+				Log.trace("Accepting patch without confirmation because behavior is set to Never")
 				return "Accept"
 			end
-		end
 
+			-- The datamodel name gets overwritten by Studio, making confirmation of it intrusive
+			-- and unnecessary. This special case allows it to be accepted without confirmation.
+			if
+				PatchSet.hasAdditions(patch) == false
+				and PatchSet.hasRemoves(patch) == false
+				and PatchSet.containsOnlyInstance(patch, instanceMap, game)
+			then
+				local datamodelUpdates = PatchSet.getUpdateForInstance(patch, instanceMap, game)
+				if
+					datamodelUpdates ~= nil
+					and next(datamodelUpdates.changedProperties) == nil
+					and datamodelUpdates.changedClassName == nil
+				then
+					Log.trace("Accepting patch without confirmation because it only contains a datamodel name change")
+					return "Accept"
+				end
+			end
+		end
 		self:setState({
 			connectingText = "Computing diff view...",
 		})
@@ -824,9 +875,11 @@ function App:startSession()
 		return self.confirmationEvent:Wait()
 	end)
 
-	serveSession:start()
-
 	self.serveSession = serveSession
+	if self.headlessBridge then
+		self.headlessBridge:bindSession(serveSession)
+	end
+	serveSession:start()
 end
 
 function App:endSession()
@@ -934,6 +987,9 @@ function App:render()
 
 					Connecting = createPageElement(AppStatus.Connecting, {
 						text = self.state.connectingText,
+						onCancel = function()
+							self:endSession()
+						end,
 					}),
 
 					Connected = createPageElement(AppStatus.Connected, {
@@ -964,6 +1020,9 @@ function App:render()
 								appStatus = self.backPage or AppStatus.NotConnected,
 							})
 						end,
+						onPluginAccess = function()
+							self:setState({ headlessPanelOpen = true })
+						end,
 					}),
 
 					Error = createPageElement(AppStatus.Error, {
@@ -988,6 +1047,13 @@ function App:render()
 						notifications = self.state.notifications,
 						onClose = function(id)
 							self:closeNotification(id)
+						end,
+					}),
+					PluginAccess = e(HeadlessPanel, {
+						state = self.state.headlessAccess,
+						open = self.state.headlessPanelOpen,
+						onClose = function()
+							self:setState({ headlessPanelOpen = false })
 						end,
 					}),
 				}),

@@ -11,10 +11,21 @@ mod json;
 mod json_model;
 mod lua;
 mod meta_file;
+mod path_arrays;
 mod project;
+mod rule_defaults;
+pub(crate) use project::snapshot_loaded_project;
+#[cfg(feature = "cli")]
+pub(crate) use project::snapshot_stdin_project;
+pub use rule_defaults::{RuleDefaultState, RuleDefaults, RuleOwner};
 mod rbxm;
 mod rbxmx;
+mod text_module;
 mod toml;
+#[cfg(feature = "cli")]
+pub(crate) use text_module::decode_text as decode_text_module;
+#[cfg(feature = "cli")]
+pub(crate) use text_module::encode_text as encode_text_module;
 mod txt;
 mod util;
 mod yaml;
@@ -30,7 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     glob::Glob,
-    project::DEFAULT_PROJECT_NAMES,
+    project::{Project, INIT_PROJECT_NAMES},
     syncback::{SyncbackReturn, SyncbackSnapshot},
 };
 use crate::{
@@ -47,15 +58,15 @@ use self::{
     project::{snapshot_project, syncback_project},
     rbxm::{snapshot_rbxm, syncback_rbxm},
     rbxmx::{snapshot_rbxmx, syncback_rbxmx},
+    text_module::{snapshot_text_module, syncback_text_module},
     toml::snapshot_toml,
     txt::{snapshot_txt, syncback_txt},
     yaml::snapshot_yaml,
 };
 
-pub use self::{
-    lua::ScriptType, project::snapshot_project_node, util::emit_legacy_scripts_default,
-    util::PathExt,
-};
+pub use self::{lua::ScriptType, util::emit_legacy_scripts_default, util::PathExt};
+#[cfg(feature = "cli")]
+pub(crate) use project::snapshot_project_node;
 
 /// Returns an `InstanceSnapshot` for the provided path.
 /// This will inspect the path and find the appropriate middleware for it,
@@ -78,27 +89,54 @@ pub fn snapshot_from_vfs(
         // If and when we do, make sure to go support it in
         // `Project::set_file_name`, as right now it special-cases
         // `default.project.json` as an `init` path.
-        match middleware {
+        let mut snapshot = match middleware {
             Middleware::Dir => middleware.snapshot(context, vfs, path, dir_name),
             _ => middleware.snapshot(context, vfs, &init_path, dir_name),
+        }?;
+        if middleware == Middleware::Project
+            && init_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| INIT_PROJECT_NAMES.contains(&name))
+        {
+            if let Some(snapshot) = &mut snapshot {
+                // The alias may cease being a directory entry. Refresh from the
+                // directory again, while keeping the actual project path last
+                // for syncback and source diagnostics.
+                snapshot.metadata.instigating_source = Some(path.to_owned().into());
+                snapshot
+                    .metadata
+                    .relevant_paths
+                    .insert(0, vfs.canonicalize(path)?);
+            }
         }
+        Ok(snapshot)
     } else {
-        let file_name = path
-            .file_name()
+        path.file_name()
             .and_then(|n| n.to_str())
             .with_context(|| format!("file name of {} is invalid", path.display()))?;
 
-        // TODO: Is this even necessary anymore?
-        match file_name {
-            "init.server.luau" | "init.server.lua" | "init.client.luau" | "init.client.lua"
-            | "init.plugin.luau" | "init.plugin.lua" | "init.luau" | "init.lua" | "init.csv" => {
-                return Ok(None)
-            }
-            _ => {}
-        }
-
         snapshot_from_path(context, vfs, path)
     }
+}
+
+// Priority order is part of directory snapshot compatibility.
+pub(crate) const INIT_PATHS: &[(Middleware, &str)] = &[
+    (Middleware::ModuleScriptDir, "init.luau"),
+    (Middleware::ModuleScriptDir, "init.lua"),
+    (Middleware::ServerScriptDir, "init.server.luau"),
+    (Middleware::ServerScriptDir, "init.server.lua"),
+    (Middleware::ClientScriptDir, "init.client.luau"),
+    (Middleware::ClientScriptDir, "init.client.lua"),
+    (Middleware::PluginScriptDir, "init.plugin.lua"),
+    (Middleware::PluginScriptDir, "init.plugin.luau"),
+    (Middleware::CsvDir, "init.csv"),
+];
+
+pub(crate) fn is_init_file_name(name: &str) -> bool {
+    INIT_PATHS
+        .iter()
+        .any(|(_, init)| init.eq_ignore_ascii_case(name))
 }
 
 /// Gets the appropriate middleware for a directory by checking for `init`
@@ -107,39 +145,26 @@ pub fn snapshot_from_vfs(
 ///
 /// Returns the middleware, the name of the directory, and the path to
 /// the init location.
-fn get_dir_middleware<'path>(
+pub(crate) fn get_dir_middleware<'path>(
     vfs: &Vfs,
     dir_path: &'path Path,
 ) -> anyhow::Result<(Middleware, &'path str, PathBuf)> {
     let dir_name = dir_path
         .file_name()
-        .expect("Could not extract directory name")
+        .with_context(|| {
+            format!(
+                "Could not extract directory name from {}",
+                dir_path.display()
+            )
+        })?
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("File name was not valid UTF-8: {}", dir_path.display()))?;
 
-    static INIT_PATHS: OnceLock<Vec<(Middleware, &str)>> = OnceLock::new();
-    let order = INIT_PATHS.get_or_init(|| {
-        vec![
-            (Middleware::ModuleScriptDir, "init.luau"),
-            (Middleware::ModuleScriptDir, "init.lua"),
-            (Middleware::ServerScriptDir, "init.server.luau"),
-            (Middleware::ServerScriptDir, "init.server.lua"),
-            (Middleware::ClientScriptDir, "init.client.luau"),
-            (Middleware::ClientScriptDir, "init.client.lua"),
-            (Middleware::PluginScriptDir, "init.plugin.lua"),
-            (Middleware::PluginScriptDir, "init.plugin.luau"),
-            (Middleware::CsvDir, "init.csv"),
-        ]
-    });
-
-    for default_project_name in DEFAULT_PROJECT_NAMES {
-        let project_path = dir_path.join(default_project_name);
-        if vfs.metadata(&project_path).with_not_found()?.is_some() {
-            return Ok((Middleware::Project, dir_name, project_path));
-        }
+    if let Some(project_path) = Project::directory_entry(vfs, dir_path)? {
+        return Ok((Middleware::Project, dir_name, project_path));
     }
 
-    for (middleware, name) in order {
+    for (middleware, name) in INIT_PATHS {
         let test_path = dir_path.join(name);
         if vfs.metadata(&test_path).with_not_found()?.is_some() {
             return Ok((*middleware, dir_name, test_path));
@@ -159,16 +184,15 @@ fn snapshot_from_path(
     if let Some(rule) = context.get_user_sync_rule(path) {
         return rule
             .middleware
+            .expect("routing rule has middleware")
             .snapshot(context, vfs, path, rule.file_name_for_path(path)?);
     } else {
         for rule in default_sync_rules() {
             if rule.matches(path) {
-                return rule.middleware.snapshot(
-                    context,
-                    vfs,
-                    path,
-                    rule.file_name_for_path(path)?,
-                );
+                return rule
+                    .middleware
+                    .expect("builtin rule has middleware")
+                    .snapshot(context, vfs, path, rule.file_name_for_path(path)?);
             }
         }
     }
@@ -214,6 +238,8 @@ pub enum Middleware {
     ModuleScriptDir,
     #[serde(skip_deserializing)]
     CsvDir,
+    /// Explicit UTF-8 file data returned by a ModuleScript.
+    TextModule,
 }
 
 impl Middleware {
@@ -251,6 +277,7 @@ impl Middleware {
             Self::Rbxmx => snapshot_rbxmx(context, vfs, path, name),
             Self::Toml => snapshot_toml(context, vfs, path, name),
             Self::Text => snapshot_txt(context, vfs, path, name),
+            Self::TextModule => snapshot_text_module(context, vfs, path, name),
             Self::Yaml => snapshot_yaml(context, vfs, path, name),
             Self::Ignore => Ok(None),
 
@@ -271,6 +298,39 @@ impl Middleware {
         };
         if let Ok(Some(ref mut snapshot)) = output {
             snapshot.metadata.middleware = Some(*self);
+            if *self != Self::Project {
+                if *self == Self::Csv && context.ignore_unknown_descendants == Some(true) {
+                    // CSV's legacy reader does not initialize inherited context.
+                    // Apply that default before rules, then restore the reader's
+                    // explicit metadata precedence without touching the CSV file.
+                    let mut ignore = true;
+                    for suffix in ["json", "jsonc"] {
+                        let meta_path = path.with_file_name(format!("{name}.meta.{suffix}"));
+                        if let Some(bytes) = vfs.read(&meta_path).with_not_found()? {
+                            let value: serde_json::Value = crate::json::from_slice(&bytes)?;
+                            if let Some(value) = value
+                                .get("ignoreUnknownInstances")
+                                .filter(|value| !value.is_null())
+                            {
+                                ignore = value.as_bool().with_context(|| {
+                                    format!(
+                                        "ignoreUnknownInstances must be boolean in {}",
+                                        meta_path.display()
+                                    )
+                                })?;
+                            }
+                        }
+                    }
+                    snapshot.metadata.ignore_unknown_instances = ignore;
+                }
+                rule_defaults::apply(context, vfs, path, name, *self, snapshot)?;
+                // Some legacy middleware deliberately does not copy context.
+                // Watch routing and all inherited policy must follow the binding.
+                // Project roots retain their own effective override.
+                snapshot.metadata.effective_sync_authority = context.sync_authority.clone();
+                snapshot.metadata.context = context.clone();
+            }
+            snapshot.metadata.context.rule_owner = None;
         }
         output
     }
@@ -287,7 +347,7 @@ impl Middleware {
                 format!("cannot create a file or directory with name {file_name}")
             })?;
         }
-        match self {
+        let mut output = match self {
             Middleware::Csv => syncback_csv(snapshot),
             Middleware::JsonModel => syncback_json_model(snapshot),
             Middleware::Json => anyhow::bail!("cannot syncback Json middleware"),
@@ -297,10 +357,16 @@ impl Middleware {
             Middleware::ServerScript => syncback_lua(snapshot),
             Middleware::ClientScript => syncback_lua(snapshot),
             Middleware::ModuleScript => syncback_lua(snapshot),
+            Middleware::PluginScript
+            | Middleware::LegacyServerScript
+            | Middleware::LegacyClientScript
+            | Middleware::RunContextServerScript
+            | Middleware::RunContextClientScript => syncback_lua(snapshot),
             Middleware::Rbxm => syncback_rbxm(snapshot),
             Middleware::Rbxmx => syncback_rbxmx(snapshot),
             Middleware::Toml => anyhow::bail!("cannot syncback Toml middleware"),
             Middleware::Text => syncback_txt(snapshot),
+            Middleware::TextModule => syncback_text_module(snapshot),
             Middleware::Yaml => anyhow::bail!("cannot syncback Yaml middleware"),
             Middleware::Ignore => anyhow::bail!("cannot syncback Ignore middleware"),
             Middleware::Dir => syncback_dir(snapshot),
@@ -309,15 +375,9 @@ impl Middleware {
             Middleware::PluginScriptDir => syncback_lua_init(ScriptType::Plugin, snapshot),
             Middleware::ModuleScriptDir => syncback_lua_init(ScriptType::Module, snapshot),
             Middleware::CsvDir => syncback_csv_init(snapshot),
-
-            Middleware::PluginScript
-            | Middleware::LegacyServerScript
-            | Middleware::LegacyClientScript
-            | Middleware::RunContextServerScript
-            | Middleware::RunContextClientScript => {
-                anyhow::bail!("syncback is not implemented for {self:?} yet")
-            }
-        }
+        }?;
+        rule_defaults::preserve_metadata_paths(snapshot, &mut output.fs_snapshot)?;
+        Ok(output)
     }
 
     /// Returns whether this particular middleware would become a directory.
@@ -367,8 +427,8 @@ impl Middleware {
             Ok(Some(middleware))
         } else {
             for rule in sync_rules.iter().chain(default_sync_rules()) {
-                if rule.matches(path) {
-                    return Ok(Some(rule.middleware));
+                if rule.middleware.is_some() && rule.matches(path) {
+                    return Ok(rule.middleware);
                 }
             }
             Ok(None)
@@ -386,7 +446,8 @@ impl Middleware {
 macro_rules! sync_rule {
     ($pattern:expr, $middleware:ident) => {
         SyncRule {
-            middleware: Middleware::$middleware,
+            middleware: Some(Middleware::$middleware),
+            defaults: None,
             include: Glob::new($pattern).unwrap(),
             exclude: None,
             suffix: None,
@@ -395,7 +456,8 @@ macro_rules! sync_rule {
     };
     ($pattern:expr, $middleware:ident, $suffix:expr) => {
         SyncRule {
-            middleware: Middleware::$middleware,
+            middleware: Some(Middleware::$middleware),
+            defaults: None,
             include: Glob::new($pattern).unwrap(),
             exclude: None,
             suffix: Some($suffix.into()),
@@ -404,7 +466,8 @@ macro_rules! sync_rule {
     };
     ($pattern:expr, $middleware:ident, $suffix:expr, $exclude:expr) => {
         SyncRule {
-            middleware: Middleware::$middleware,
+            middleware: Some(Middleware::$middleware),
+            defaults: None,
             include: Glob::new($pattern).unwrap(),
             exclude: Some(Glob::new($exclude).unwrap()),
             suffix: Some($suffix.into()),
@@ -442,4 +505,158 @@ pub fn default_sync_rules() -> &'static [SyncRule] {
             sync_rule!("*.{yml,yaml}", Yaml),
         ]
     })
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn explicit_init_file_paths_are_leaf_instances() {
+        use memofs::{InMemoryFs, VfsSnapshot};
+        for (middleware, file_name) in INIT_PATHS {
+            let source = if *middleware == Middleware::CsvDir {
+                "Key,Source\nExample,Text"
+            } else {
+                "return 42"
+            };
+            let mut fs = InMemoryFs::new();
+            fs.load_snapshot("/project", VfsSnapshot::dir([
+                ("default.project.json", VfsSnapshot::file(format!(
+                    r#"{{"name":"Root","emitLegacyScripts":true,"tree":{{"$className":"Folder","Selected":{{"$path":"src/{file_name}"}}}}}}"#
+                ))),
+                ("src", VfsSnapshot::dir([
+                    (*file_name, VfsSnapshot::file(source)),
+                    ("unrelated.luau", VfsSnapshot::file("return 'unrelated'")),
+                ])),
+            ])).unwrap();
+            let vfs = Vfs::new(fs);
+            let snapshot = snapshot_from_vfs(
+                &InstanceContext::default(),
+                &vfs,
+                Path::new("/project/default.project.json"),
+            )
+            .unwrap()
+            .unwrap();
+            let selected = &snapshot.children[0];
+            assert_eq!(selected.name, "Selected", "{file_name}");
+            assert!(
+                selected.children.is_empty(),
+                "{file_name} imported sibling files"
+            );
+            let class = match middleware {
+                Middleware::ModuleScriptDir => "ModuleScript",
+                Middleware::ClientScriptDir => "LocalScript",
+                Middleware::CsvDir => "LocalizationTable",
+                _ => "Script",
+            };
+            assert_eq!(selected.class_name, class, "{file_name}");
+            if *middleware != Middleware::CsvDir {
+                assert_eq!(
+                    selected.properties.get(&"Source".into()),
+                    Some(&rbx_dom_weak::types::Variant::String(source.into()))
+                );
+            } else {
+                let contents = selected.properties.get(&"Contents".into()).unwrap();
+                assert!(
+                    matches!(contents, rbx_dom_weak::types::Variant::String(value) if value.contains("Text"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_root_init_file_does_not_import_its_siblings() {
+        use memofs::{InMemoryFs, VfsSnapshot};
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/project",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(r#"{"name":"Root","tree":{"$path":"src/init.luau"}}"#),
+                ),
+                (
+                    "src",
+                    VfsSnapshot::dir([
+                        ("init.luau", VfsSnapshot::file("return 42")),
+                        ("unrelated.luau", VfsSnapshot::file("return true")),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(fs);
+        let project = Path::new("/project/default.project.json");
+        for source in ["return 42", "return 99"] {
+            vfs.write("/project/src/init.luau", source).unwrap();
+            let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, project)
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.name, "Root");
+            assert_eq!(snapshot.class_name, "ModuleScript");
+            assert!(snapshot.children.is_empty());
+            assert_eq!(
+                snapshot.properties.get(&"Source".into()),
+                Some(&rbx_dom_weak::types::Variant::String(source.into()))
+            );
+        }
+    }
+
+    #[test]
+    fn case_variant_init_remains_an_ordinary_child_on_a_case_sensitive_backend() {
+        use memofs::{InMemoryFs, VfsSnapshot};
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/src",
+            VfsSnapshot::dir([("Init.luau", VfsSnapshot::file("return 42"))]),
+        )
+        .unwrap();
+        let snapshot = snapshot_from_vfs(
+            &InstanceContext::default(),
+            &Vfs::new(fs),
+            Path::new("/src"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot.class_name, "Folder");
+        assert_eq!(snapshot.children.len(), 1);
+        assert_eq!(snapshot.children[0].name, "Init");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn case_variant_init_file_is_not_duplicated_under_a_renamed_project_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("Init.luau"), "return 42").unwrap();
+        std::fs::write(src.join("helper.luau"), "return true").unwrap();
+        let project = dir.path().join("default.project.json");
+        std::fs::write(&project, r#"{"name":"Renamed","tree":{"$path":"src"}}"#).unwrap();
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, &project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.name, "Renamed");
+        assert_eq!(snapshot.class_name, "ModuleScript");
+        assert_eq!(
+            snapshot.children.len(),
+            1,
+            "Init.luau became both parent source and a child"
+        );
+        assert_eq!(snapshot.children[0].name, "helper");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unnamed_directory_returns_a_path_error() {
+        let vfs = Vfs::new(memofs::InMemoryFs::new());
+        let root = Path::new("C:\\");
+        let error = get_dir_middleware(&vfs, root).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&root.display().to_string()), "{message}");
+        assert!(message.contains("directory name"), "{message}");
+    }
 }

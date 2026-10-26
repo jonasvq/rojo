@@ -6,6 +6,30 @@
 use anyhow::Context as _;
 use serde::de::DeserializeOwned;
 
+/// Diagnose ignored fields without changing permissive model/metadata parsing.
+pub(crate) fn warn_unknown_fields(
+    value: &serde_json::Value,
+    allowed: &[&str],
+    path: &std::path::Path,
+    location: &str,
+) {
+    if let Some(object) = value.as_object() {
+        for key in object.keys().filter(|key| !allowed.contains(&key.as_str())) {
+            if let Some(corrected) = key.strip_prefix('$').filter(|key| allowed.contains(key)) {
+                log::warn!("Unknown field '{}' at {} in {}. Use '{}' here; '$' prefixes belong to project tree fields.", key, location, path.display(), corrected);
+            } else {
+                log::warn!(
+                    "Unknown field '{}' at {} in {} will be ignored. Supported fields: {}.",
+                    key,
+                    location,
+                    path.display(),
+                    allowed.join(", ")
+                );
+            }
+        }
+    }
+}
+
 /// Parse JSONC text into a `serde_json::Value`.
 ///
 /// This handles the common pattern of calling `jsonc_parser::parse_to_serde_value`
@@ -17,6 +41,7 @@ use serde::de::DeserializeOwned;
 /// - The text is not valid JSONC
 /// - The text contains no JSON value
 pub fn parse_value(text: &str) -> anyhow::Result<serde_json::Value> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     jsonc_parser::parse_to_serde_value(text, &Default::default())
         .context("Failed to parse JSONC")?
         .ok_or_else(|| anyhow::anyhow!("File contains no JSON value"))
@@ -36,6 +61,7 @@ pub fn parse_value_with_context(
     text: &str,
     context: impl Fn() -> String,
 ) -> anyhow::Result<serde_json::Value> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     jsonc_parser::parse_to_serde_value(text, &Default::default())
         .with_context(|| format!("{}: JSONC parse error", context()))?
         .ok_or_else(|| anyhow::anyhow!("{}: File contains no JSON value", context()))
@@ -190,6 +216,48 @@ mod tests {
     struct TestStruct {
         foo: String,
         bar: i32,
+    }
+
+    #[test]
+    fn utf8_bom_is_accepted_by_all_jsonc_entry_points() {
+        let text = "\u{feff}// Editor-generated UTF-8 BOM\n{\"foo\":\"hello\",\"bar\":42,}";
+        let expected = serde_json::json!({"foo":"hello","bar":42});
+        assert_eq!(parse_value(text).unwrap(), expected);
+        assert_eq!(
+            parse_value_with_context(text, || "data.json".into()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse_value_from_slice_with_context(text.as_bytes(), || "data.json".into()).unwrap(),
+            expected
+        );
+        for parsed in [
+            from_str::<TestStruct>(text),
+            from_str_with_context::<TestStruct>(text, || "data.json".into()),
+            from_slice::<TestStruct>(text.as_bytes()),
+            from_slice_with_context::<TestStruct>(text.as_bytes(), || "data.json".into()),
+        ] {
+            assert_eq!(
+                parsed.unwrap(),
+                TestStruct {
+                    foo: "hello".into(),
+                    bar: 42
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn bom_handling_preserves_string_contents_and_rejects_extra_prefixes() {
+        assert_eq!(
+            parse_value("\u{feff}\"\u{feff}kept\"").unwrap(),
+            "\u{feff}kept"
+        );
+        assert!(parse_value("\u{feff}\u{feff}{}").is_err());
+        assert!(parse_value(" \u{feff}{}").is_err());
+        let error =
+            parse_value_with_context("\u{feff}{invalid}", || "broken.json".into()).unwrap_err();
+        assert!(format!("{error:#}").contains("broken.json"));
     }
 
     #[test]

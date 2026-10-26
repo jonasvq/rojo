@@ -10,14 +10,21 @@ local Log = require(Packages.Log)
 
 local PatchSet = require(script.Parent.Parent.PatchSet)
 local Types = require(script.Parent.Parent.Types)
-local invariant = require(script.Parent.Parent.invariant)
 
 local decodeValue = require(script.Parent.decodeValue)
 local reify = require(script.Parent.reify)
 local reifyInstance, applyDeferredRefs = reify.reifyInstance, reify.applyDeferredRefs
 local setProperty = require(script.Parent.setProperty)
+local resetProperty = require(script.Parent.resetProperty)
+local adoptAdded = require(script.Parent.adoptAdded)
 
-local function applyPatch(instanceMap, patch)
+local function applyPatch(instanceMap, patch, adoptMatchingInstances)
+	if adoptMatchingInstances and next(patch.added) then
+		local adopted, reason = adoptAdded(instanceMap, patch)
+		if not adopted then
+			return patch, reason
+		end
+	end
 	-- Tracks any portions of the patch that could not be applied to the DOM.
 	local unappliedPatch = PatchSet.newEmpty()
 
@@ -40,6 +47,9 @@ local function applyPatch(instanceMap, patch)
 	end
 
 	for id, virtualInstance in pairs(patch.added) do
+		if unappliedPatch.added[id] ~= nil then
+			continue
+		end
 		if instanceMap.fromIds[id] ~= nil then
 			-- This instance already exists. We might've already added it in a
 			-- previous iteration of this loop, or maybe this patch was not
@@ -58,18 +68,23 @@ local function applyPatch(instanceMap, patch)
 			id = virtualInstance.Parent
 			virtualInstance = patch.added[id]
 		end
+		if unappliedPatch.added[id] ~= nil then
+			continue
+		end
 
 		local parentInstance = instanceMap.fromIds[virtualInstance.Parent]
 
 		if parentInstance == nil then
-			-- This would be peculiar. If you create an instance with no
-			-- parent, were you supposed to create it at all?
-			invariant(
-				"Cannot add an instance from a patch that has no parent.\nInstance {} with parent {}.\nState: {:#?}",
-				id,
-				virtualInstance.Parent,
-				instanceMap
+			-- A parent may have failed creation in an earlier patch. Keep this
+			-- entire addition available for retry instead of creating orphans.
+			reify.markUnappliedSubtree(unappliedPatch, patch.added, id)
+			Log.warn(
+				"Cannot add {} ({}) because managed parent {} is unavailable. Its subtree remains unapplied; check earlier parent-creation errors or reconnect.",
+				virtualInstance.Name,
+				virtualInstance.ClassName,
+				virtualInstance.Parent
 			)
+			continue
 		end
 
 		local failedToReify = reifyInstance(deferredRefs, instanceMap, patch.added, id, parentInstance)
@@ -191,11 +206,15 @@ local function applyPatch(instanceMap, patch)
 		end
 
 		if update.changedMetadata ~= nil then
-			-- TODO: Support changing metadata. This will become necessary when
-			-- Rojo persistently tracks metadata for each instance in order to
-			-- remove extra instances.
-			unappliedUpdate.changedMetadata = update.changedMetadata
-			partiallyApplied = true
+			-- ignoreUnknownInstances is server sync policy, with no DOM property
+			-- to assign. Rejecting it would serialize and replace healthy sources
+			-- whenever a project's rule context changes.
+			for key in update.changedMetadata do
+				if key ~= "ignoreUnknownInstances" then
+					unappliedUpdate.changedMetadata = update.changedMetadata
+					partiallyApplied = true
+				end
+			end
 		end
 
 		if update.changedProperties ~= nil then
@@ -224,6 +243,16 @@ local function applyPatch(instanceMap, patch)
 					unappliedUpdate.changedProperties[propertyName] = propertyValue
 					partiallyApplied = true
 				end
+			end
+		end
+
+		for _, propertyName in update.removedProperties or {} do
+			local resetSuccess, resetError = resetProperty(instance, propertyName)
+			if not resetSuccess then
+				Log.warn("Failed to reset {}.{}: {}", instance.ClassName, propertyName, resetError)
+				unappliedUpdate.removedProperties = unappliedUpdate.removedProperties or {}
+				table.insert(unappliedUpdate.removedProperties, propertyName)
+				partiallyApplied = true
 			end
 		end
 

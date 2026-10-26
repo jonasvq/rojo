@@ -49,8 +49,27 @@ function ConfirmingPage:render()
 				BackgroundTransparency = 1,
 			}),
 
+			AuthorityReview = if self.props.confirmData.serverInfo.classAuthorityReview
+				then e("TextLabel", {
+					Text = "Class authority or structure changed. Accept applies the displayed changes and new policy; abort retains current Studio values.",
+					FontFace = theme.Font.Thin,
+					TextSize = theme.TextSize.Body,
+					TextColor3 = theme.TextColor,
+					TextWrapped = true,
+					TextTransparency = self.props.transparency,
+					Size = UDim2.new(1, 0, 0, 48),
+					LayoutOrder = 2,
+					BackgroundTransparency = 1,
+				})
+				else nil,
+
 			PatchVisualizer = e(PatchVisualizer, {
-				size = UDim2.new(1, 0, 1, -100),
+				size = UDim2.new(
+					1,
+					0,
+					1,
+					if self.props.confirmData.serverInfo.classAuthorityReview then -158 else -100
+				),
 				transparency = self.props.transparency,
 				layoutOrder = 3,
 

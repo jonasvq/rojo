@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::{collections::HashSet, io};
@@ -14,6 +14,8 @@ pub struct StdBackend {
     watcher: RecommendedWatcher,
     watcher_receiver: Receiver<VfsEvent>,
     watches: HashSet<PathBuf>,
+    parent_watches: HashSet<PathBuf>,
+    directory_watches: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl StdBackend {
@@ -22,14 +24,25 @@ impl StdBackend {
         let watcher = watcher(notify_tx, Duration::from_millis(50)).map_err(io::Error::other)?;
 
         let (tx, rx) = crossbeam_channel::unbounded();
+        let directory_watches = Arc::new(Mutex::new(HashSet::new()));
+        let forwarding_directory_watches = Arc::clone(&directory_watches);
 
         thread::spawn(move || {
             for event in notify_rx {
+                log::trace!("watcher event: {:?}", event);
                 match event {
                     DebouncedEvent::Create(path) => {
                         tx.send(VfsEvent::Create(path))?;
                     }
                     DebouncedEvent::Write(path) => {
+                        // Parent guards also report metadata writes on watched
+                        // directories. Their recursive watch already reports the
+                        // actual child changes; forwarding both duplicates work.
+                        if path.is_dir()
+                            && forwarding_directory_watches.lock().unwrap().contains(&path)
+                        {
+                            continue;
+                        }
                         tx.send(VfsEvent::Write(path))?;
                     }
                     DebouncedEvent::Remove(path) => {
@@ -50,7 +63,36 @@ impl StdBackend {
             watcher,
             watcher_receiver: rx,
             watches: HashSet::new(),
+            parent_watches: HashSet::new(),
+            directory_watches,
         })
+    }
+
+    fn watch_parent(&mut self, path: &Path) -> io::Result<()> {
+        let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            return Ok(());
+        };
+        if self.parent_watches.contains(parent)
+            || parent
+                .ancestors()
+                .any(|ancestor| self.watches.contains(ancestor))
+        {
+            return Ok(());
+        }
+        // A watch on the source itself cannot see its own recreation. Only
+        // watch the parent's immediate entries, rather than unrelated subtrees.
+        log::trace!(
+            "watch {}: registering parent non-recursively",
+            parent.display()
+        );
+        self.watcher
+            .watch(parent, RecursiveMode::NonRecursive)
+            .map_err(io::Error::other)?;
+        self.parent_watches.insert(parent.to_path_buf());
+        Ok(())
     }
 }
 
@@ -115,22 +157,72 @@ impl VfsBackend for StdBackend {
     }
 
     fn watch(&mut self, path: &Path) -> io::Result<()> {
-        if self.watches.contains(path)
-            || path
-                .ancestors()
-                .any(|ancestor| self.watches.contains(ancestor))
+        if self.watches.contains(path) {
+            return self.watch_parent(path);
+        }
+        if path
+            .ancestors()
+            .any(|ancestor| self.watches.contains(ancestor))
         {
+            log::trace!("watch {}: covered by existing watch", path.display());
             Ok(())
         } else {
-            self.watches.insert(path.to_path_buf());
+            self.watch_parent(path)?;
+            if self.parent_watches.remove(path) {
+                self.watcher.unwatch(path).map_err(io::Error::other)?;
+            }
+            log::trace!("watch {}: registering recursively", path.display());
             self.watcher
                 .watch(path, RecursiveMode::Recursive)
-                .map_err(io::Error::other)
+                .map_err(io::Error::other)?;
+            // Failed native registration must never count as an active watch.
+            self.watches.insert(path.to_path_buf());
+            if path.is_dir() {
+                self.directory_watches
+                    .lock()
+                    .unwrap()
+                    .insert(path.to_path_buf());
+            }
+            Ok(())
         }
     }
 
     fn unwatch(&mut self, path: &Path) -> io::Result<()> {
-        self.watches.remove(path);
-        self.watcher.unwatch(path).map_err(io::Error::other)
+        log::trace!("unwatch {}", path.display());
+        let recursive = self.watches.remove(path);
+        self.directory_watches.lock().unwrap().remove(path);
+        let parent = self.parent_watches.remove(path);
+        if recursive || parent {
+            self.watcher.unwatch(path).map_err(io::Error::other)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn failed_watch_registration_can_be_retried_after_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let mut backend = StdBackend::new().unwrap();
+        assert!(backend.watch(&missing).is_err());
+        fs_err::create_dir(&missing).unwrap();
+        backend.watch(&missing).unwrap();
+        let created = missing.join("new.luau");
+        fs_err::write(&created, "return 1").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let event = backend
+                .event_receiver()
+                .recv_deadline(deadline)
+                .expect("retried watch never reported the new file");
+            if matches!(event, VfsEvent::Create(path) if path == created) {
+                break;
+            }
+        }
     }
 }

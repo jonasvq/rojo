@@ -1,14 +1,13 @@
+#[cfg(feature = "cli")]
 use std::{
     env, io,
     path::{Path, PathBuf},
 };
 
-use fs_err as fs;
-use fs_err::File;
-use maplit::hashmap;
-use memofs::VfsSnapshot;
-use semver::Version;
+#[cfg(feature = "cli")]
+use {fs_err as fs, fs_err::File, maplit::hashmap, memofs::VfsSnapshot, semver::Version};
 
+#[cfg(feature = "cli")]
 fn snapshot_from_fs_path(path: &Path) -> io::Result<VfsSnapshot> {
     println!("cargo:rerun-if-changed={}", path.display());
 
@@ -47,6 +46,10 @@ fn snapshot_from_fs_path(path: &Path) -> io::Result<VfsSnapshot> {
     }
 }
 
+#[cfg(not(feature = "cli"))]
+fn main() {}
+
+#[cfg(feature = "cli")]
 fn main() -> Result<(), anyhow::Error> {
     let out_dir = env::var_os("OUT_DIR").unwrap();
 

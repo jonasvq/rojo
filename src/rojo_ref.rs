@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 pub const REF_ID_ATTRIBUTE_NAME: &str = "Rojo_Id";
-pub const REF_POINTER_ATTRIBUTE_PREFIX: &str = "Rojo_Target_";
+pub use rojo_project_types::REF_POINTER_ATTRIBUTE_PREFIX;
 
 // TODO add an internment strategy for RojoRefs
 // Something like what rbx-dom does for SharedStrings probably works

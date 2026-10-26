@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::Context;
-use memofs::{DirEntry, Vfs};
+use memofs::{DirEntry, IoResultExt as _, Vfs};
 
 use crate::{
     snapshot::{
@@ -55,7 +55,46 @@ pub fn snapshot_dir_no_meta(
             continue;
         }
 
+        // Init files already supply the parent's source. Only directory scans
+        // skip them; an explicit $path may still refer to the file itself.
+        if let Some((_, init_name)) = entry
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| {
+                super::INIT_PATHS
+                    .iter()
+                    .find(|(_, init)| init.eq_ignore_ascii_case(name))
+            })
+        {
+            let init_path = path.join(init_name);
+            if vfs
+                .metadata(&init_path)
+                .with_not_found()?
+                .is_some_and(|meta| meta.is_file())
+            {
+                if entry.path() == init_path {
+                    continue;
+                }
+                // A differently cased name is special only when this filesystem
+                // resolves it to the same init file, rather than a separate child.
+                let canonical = vfs.canonicalize(&init_path).with_not_found()?;
+                if canonical.is_some()
+                    && canonical == vfs.canonicalize(entry.path()).with_not_found()?
+                {
+                    continue;
+                }
+            }
+        }
+
         if let Some(child_snapshot) = snapshot_from_vfs(context, vfs, entry.path())? {
+            if context.ignore_empty_directories
+                && child_snapshot.metadata.middleware == Some(super::Middleware::Dir)
+                && child_snapshot.children.is_empty()
+                && physically_empty_tree(vfs, entry.path())?
+            {
+                continue;
+            }
             snapshot_children.push(child_snapshot);
         }
     }
@@ -91,6 +130,18 @@ pub fn snapshot_dir_no_meta(
     Ok(Some(snapshot))
 }
 
+// Snapshot emptiness alone is insufficient: ignored/unknown files and .gitkeep
+// still express physical content, so they preserve a directory intentionally.
+fn physically_empty_tree(vfs: &Vfs, path: &Path) -> anyhow::Result<bool> {
+    for entry in vfs.read_dir(path)? {
+        let entry = entry?;
+        if !vfs.metadata(entry.path())?.is_dir() || !physically_empty_tree(vfs, entry.path())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub fn syncback_dir<'sync>(
     snapshot: &SyncbackSnapshot<'sync>,
 ) -> anyhow::Result<SyncbackReturn<'sync>> {
@@ -100,13 +151,22 @@ pub fn syncback_dir<'sync>(
 
     let mut meta = DirectoryMetadata::from_syncback_snapshot(snapshot, snapshot.path.clone())?;
     if let Some(meta) = &mut meta {
-        if new_inst.class != "Folder" {
+        let state = super::rule_defaults::syncback_state(snapshot)?;
+        let default_class = state
+            .as_ref()
+            .filter(|s| !s.mask.disable_class_name)
+            .and_then(|s| s.class_name)
+            .unwrap_or("Folder".into());
+        if new_inst.class != default_class || state.as_ref().is_some_and(|s| s.explicit_class) {
             meta.class_name = Some(new_inst.class);
         }
 
         if !meta.is_empty() {
             dir_syncback.fs_snapshot.add_file(
-                snapshot.path.join("init.meta.json"),
+                super::lua::metadata_destination(
+                    snapshot.vfs(),
+                    &snapshot.path.join("init.meta.json"),
+                )?,
                 serde_json::to_vec_pretty(&meta)
                     .context("could not serialize new init.meta.json")?,
             );

@@ -20,13 +20,13 @@ local function addAllToPatch(patchSet, virtualInstances, id)
 	end
 end
 
-function reifyInstance(deferredRefs, instanceMap, virtualInstances, rootId, parentInstance)
+function reifyInstance(deferredRefs, instanceMap, virtualInstances, rootId, parentInstance, onCreated)
 	-- Create an empty patch that will be populated with any parts of this reify
 	-- that could not happen, like instances that couldn't be created and
 	-- properties that could not be assigned.
 	local unappliedPatch = PatchSet.newEmpty()
 
-	reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualInstances, rootId, parentInstance)
+	reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualInstances, rootId, parentInstance, onCreated)
 
 	return unappliedPatch
 end
@@ -34,7 +34,7 @@ end
 --[[
 	Inner function that defines the core routine.
 ]]
-function reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualInstances, id, parentInstance)
+function reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualInstances, id, parentInstance, onCreated)
 	local virtualInstance = virtualInstances[id]
 
 	if virtualInstance == nil then
@@ -49,6 +49,9 @@ function reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualIn
 	if not createSuccess then
 		addAllToPatch(unappliedPatch, virtualInstances, id)
 		return
+	end
+	if onCreated then
+		onCreated(instance)
 	end
 
 	-- TODO: Can this fail? Previous versions of Rojo guarded against this, but
@@ -93,7 +96,7 @@ function reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualIn
 	end
 
 	for _, childId in ipairs(virtualInstance.Children) do
-		reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualInstances, childId, instance)
+		reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualInstances, childId, instance, onCreated)
 	end
 
 	instance.Parent = parentInstance
@@ -127,15 +130,8 @@ function applyDeferredRefs(instanceMap, deferredRefs, unappliedPatch)
 	end
 
 	for _, entry in deferredRefs do
-		local _, refId = next(entry.virtualValue)
-
-		if refId == nil then
-			continue
-		end
-
-		local targetInstance = instanceMap.fromIds[refId]
-
-		if targetInstance == nil then
+		local decodeSuccess, targetInstance = decodeValue(entry.virtualValue, instanceMap)
+		if not decodeSuccess then
 			markFailed(entry.id, entry.propertyName, entry.virtualValue)
 			continue
 		end
@@ -150,4 +146,5 @@ end
 return {
 	reifyInstance = reifyInstance,
 	applyDeferredRefs = applyDeferredRefs,
+	markUnappliedSubtree = addAllToPatch,
 }

@@ -5,13 +5,14 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::Context;
 use clap::Parser;
 use memofs::Vfs;
 use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 
 use crate::{serve_session::ServeSession, web::LiveServer};
 
-use super::{resolve_path, GlobalOptions};
+use super::{resolve_project_path, GlobalOptions};
 
 const DEFAULT_BIND_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const DEFAULT_PORT: u16 = 34872;
@@ -39,11 +40,44 @@ pub struct ServeCommand {
     /// validation for binds where it is otherwise off (such as `0.0.0.0`).
     #[clap(long, value_delimiter = ',')]
     pub allowed_hosts: Vec<String>,
+
+    /// Maximum HTTP API request body size in bytes; must be positive.
+    #[clap(long, default_value_t = crate::web::DEFAULT_MAX_REQUEST_BODY_BYTES, value_parser = parse_body_limit)]
+    pub max_request_body_bytes: usize,
+    /// Forward Studio errors, including their stack context.
+    #[clap(long)]
+    pub sync_error_log: bool,
+    /// Forward Studio warnings.
+    #[clap(long)]
+    pub sync_warn_log: bool,
+    /// Forward Studio informational output.
+    #[clap(long)]
+    pub sync_info_log: bool,
+    /// Forward Studio print output.
+    #[clap(long)]
+    pub sync_output_log: bool,
+    /// Forward all Studio output levels.
+    #[clap(long)]
+    pub sync_logs: bool,
+    /// Enable automatic debugger plans with separate Studio consent (loopback only).
+    #[clap(long)]
+    pub debugger_plans: bool,
+}
+
+fn parse_body_limit(value: &str) -> Result<usize, String> {
+    value
+        .parse::<std::num::NonZeroUsize>()
+        .map(std::num::NonZeroUsize::get)
+        .map_err(|_| {
+            "request body limit must be a positive integer representable as usize".to_owned()
+        })
 }
 
 impl ServeCommand {
     pub fn run(self, global: GlobalOptions) -> anyhow::Result<()> {
-        let project_path = resolve_path(&self.project)?;
+        let limit = std::num::NonZeroUsize::new(self.max_request_body_bytes)
+            .context("HTTP request body limit must be positive")?;
+        let project_path = resolve_project_path(&self.project)?;
 
         let vfs = Vfs::new_default()?;
 
@@ -67,7 +101,15 @@ impl ServeCommand {
             self.allowed_hosts
         };
 
-        let server = LiveServer::new(session);
+        let server = LiveServer::new(session)
+            .with_request_body_limit(limit)
+            .with_output_logs(
+                self.sync_logs || self.sync_error_log,
+                self.sync_logs || self.sync_warn_log,
+                self.sync_logs || self.sync_info_log,
+                self.sync_logs || self.sync_output_log,
+            )
+            .with_debugger_plans(self.debugger_plans);
 
         server.start((ip, port).into(), allowed_hosts, || {
             let _ = show_start_message(ip, port, global.color.into());
@@ -134,4 +176,31 @@ fn show_start_message(bind_address: IpAddr, port: u16, color: ColorChoice) -> io
     writer.print(&buffer)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn request_body_limit_cli_validates_default_and_positive_override() {
+        assert_eq!(
+            ServeCommand::try_parse_from(["serve"])
+                .unwrap()
+                .max_request_body_bytes,
+            crate::web::DEFAULT_MAX_REQUEST_BODY_BYTES
+        );
+        assert_eq!(
+            ServeCommand::try_parse_from(["serve", "--max-request-body-bytes", "123456789"])
+                .unwrap()
+                .max_request_body_bytes,
+            123456789
+        );
+        for value in ["0", "-1", "1.5", "18446744073709551616"] {
+            assert!(
+                ServeCommand::try_parse_from(["serve", "--max-request-body-bytes", value]).is_err(),
+                "{value}"
+            );
+        }
+    }
 }

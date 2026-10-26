@@ -1,7 +1,8 @@
 use std::{
     borrow::Cow,
+    cell::RefCell,
     collections::{BTreeMap, HashMap, VecDeque},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{bail, Context};
@@ -13,7 +14,7 @@ use rbx_dom_weak::{
 use rbx_reflection::ClassTag;
 
 use crate::{
-    project::{PathNode, Project, ProjectNode},
+    project::{PathNode, Project, ProjectFormatVersion, ProjectNode},
     resolution::UnresolvedValue,
     snapshot::{
         InstanceContext, InstanceMetadata, InstanceSnapshot, InstanceWithMeta, InstigatingSource,
@@ -25,7 +26,47 @@ use crate::{
     RojoRef,
 };
 
-use super::{emit_legacy_scripts_default, snapshot_from_vfs};
+use super::snapshot_from_vfs;
+
+thread_local! {
+    static ACTIVE_PROJECTS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+struct ProjectSnapshotGuard;
+
+impl ProjectSnapshotGuard {
+    fn enter(vfs: &Vfs, path: &Path) -> anyhow::Result<Self> {
+        let path = vfs
+            .canonicalize(path)
+            .with_context(|| format!("Could not resolve project path {}", path.display()))?;
+        Self::enter_key(path)
+    }
+
+    fn enter_key(path: PathBuf) -> anyhow::Result<Self> {
+        ACTIVE_PROJECTS.with(|active| {
+            let mut active = active.borrow_mut();
+            if active.contains(&path) {
+                let chain = active
+                    .iter()
+                    .chain(std::iter::once(&path))
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                bail!("Circular project reference: {chain}");
+            }
+            active.push(path);
+            Ok(Self)
+        })
+    }
+}
+
+impl Drop for ProjectSnapshotGuard {
+    fn drop(&mut self) {
+        ACTIVE_PROJECTS.with(|active| {
+            active.borrow_mut().pop();
+        });
+    }
+}
 
 pub fn snapshot_project(
     context: &InstanceContext,
@@ -33,15 +74,69 @@ pub fn snapshot_project(
     path: &Path,
     name: &str,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
+    // Keep traversal state outside persisted snapshot contexts so later file
+    // updates and independent aliases can load the same project again.
+    let _guard = ProjectSnapshotGuard::enter(vfs, path)?;
     let project = Project::load_exact(vfs, path, Some(name))
         .with_context(|| format!("File was not a valid Rojo project: {}", path.display()))?;
-    let project_name = match project.name.as_deref() {
-        Some(name) => name,
-        None => panic!("Project is missing a name"),
-    };
+    snapshot_project_contents(context, vfs, &project)
+}
 
+pub(crate) fn snapshot_loaded_project(
+    context: &InstanceContext,
+    vfs: &Vfs,
+    project: &Project,
+) -> anyhow::Result<Option<InstanceSnapshot>> {
+    let _guard = ProjectSnapshotGuard::enter(vfs, &project.file_location)?;
+    snapshot_project_contents(context, vfs, project)
+}
+
+pub(crate) fn snapshot_stdin_project(
+    context: &InstanceContext,
+    vfs: &Vfs,
+    project: &Project,
+) -> anyhow::Result<Option<InstanceSnapshot>> {
+    // stdin has no file to canonicalize. Its parent is an actual source base;
+    // retain a unique traversal key without creating a temporary project file.
+    let parent = vfs.canonicalize(project.folder_location())?;
+    let key = parent.join(
+        project
+            .file_location
+            .file_name()
+            .context("stdin origin has no filename")?,
+    );
+    let _guard = ProjectSnapshotGuard::enter_key(key)?;
+    snapshot_project_contents(context, vfs, project)
+}
+
+fn snapshot_project_contents(
+    context: &InstanceContext,
+    vfs: &Vfs,
+    project: &Project,
+) -> anyhow::Result<Option<InstanceSnapshot>> {
+    let path = &project.file_location;
+    let project_name = project
+        .name
+        .as_deref()
+        .with_context(|| format!("Project is missing a name: {}", path.display()))?;
+
+    let incoming_ignore_empty = context.ignore_empty_directories;
+    let incoming_policy = context.ignore_unknown_descendants;
+    let incoming_authority = context.sync_authority.clone();
     let mut context = context.clone();
+    if let Some(authority) = &project.sync_authority {
+        context.sync_authority = Some(std::sync::Arc::new(authority.clone()));
+    }
+    if context.ignore_unknown_descendants.is_none()
+        && project.format_version == Some(ProjectFormatVersion::V2)
+    {
+        context.ignore_unknown_descendants = Some(true);
+    }
     context.clear_sync_rules();
+    context.rule_owner = None;
+    if let Some(ignore_empty) = project.ignore_empty_directories {
+        context.ignore_empty_directories = ignore_empty;
+    }
 
     let rules = project.glob_ignore_paths.iter().map(|glob| PathIgnoreRule {
         glob: glob.clone(),
@@ -55,12 +150,7 @@ pub fn snapshot_project(
 
     context.add_sync_rules(sync_rules);
     context.add_path_ignore_rules(rules);
-    context.set_emit_legacy_scripts(
-        project
-            .emit_legacy_scripts
-            .or_else(emit_legacy_scripts_default)
-            .unwrap(),
-    );
+    context.set_emit_legacy_scripts(project.effective_emit_legacy_scripts());
 
     match snapshot_project_node(&context, path, project_name, &project.tree, vfs, None)? {
         Some(found_snapshot) => {
@@ -74,6 +164,11 @@ pub fn snapshot_project(
             // conservative approach of snapshotting the project file if any
             // relevant paths changed.
             snapshot.metadata.instigating_source = Some(path.to_path_buf().into());
+            // Root refreshes must inherit from the enclosing project again if
+            // this project's explicit override was removed in the meantime.
+            snapshot.metadata.context.ignore_empty_directories = incoming_ignore_empty;
+            snapshot.metadata.context.ignore_unknown_descendants = incoming_policy;
+            snapshot.metadata.context.sync_authority = incoming_authority;
 
             // Mark this snapshot (the root node of the project file) as being
             // related to the project file.
@@ -99,7 +194,15 @@ pub fn snapshot_project_node(
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
     let project_folder = project_path.parent().unwrap();
 
+    let incoming_policy = context.ignore_unknown_descendants;
+    let mut node_context = context.clone();
+    if let Some(policy) = node.ignore_unknown_descendants {
+        node_context.ignore_unknown_descendants = Some(policy);
+    }
+    let context = &node_context;
+
     let mut class_name_from_path = None;
+    let mut snapshot_id = Ref::none();
 
     let name = Cow::Owned(instance_name.to_owned());
     let mut properties = UstrMap::new();
@@ -107,17 +210,38 @@ pub fn snapshot_project_node(
     let mut metadata = InstanceMetadata::new().context(context);
 
     if let Some(path_node) = &node.path {
-        let path = path_node.path();
-
-        // If the path specified in the project is relative, we assume it's
-        // relative to the folder that the project is in, project_folder.
-        let full_path = if path.is_relative() {
-            Cow::Owned(project_folder.join(path))
+        let path_snapshot = if let PathNode::Multiple(paths) = path_node {
+            Some(super::path_arrays::snapshot_paths(
+                context,
+                vfs,
+                project_path,
+                instance_name,
+                paths,
+            )?)
         } else {
-            Cow::Borrowed(path)
-        };
+            let path = path_node.path();
 
-        if let Some(snapshot) = snapshot_from_vfs(context, vfs, &full_path)? {
+            // If the path specified in the project is relative, we assume it's
+            // relative to the folder that the project is in, project_folder.
+            let full_path = if path.is_relative() {
+                Cow::Owned(project_folder.join(path))
+            } else {
+                Cow::Borrowed(path)
+            };
+
+            let mut source_context = context.clone();
+            source_context.rule_owner = Some(std::sync::Arc::new(super::RuleOwner {
+                path: full_path.to_path_buf(),
+                class_name: node.class_name,
+                mask: node.rule_default_mask().clone(),
+            }));
+            snapshot_from_vfs(&source_context, vfs, &full_path)?
+        };
+        if let Some(mut snapshot) = path_snapshot {
+            // References inside a model still point at its original root ID.
+            // Keep that mapping through every project layer before patching.
+            snapshot_id = snapshot.snapshot_id;
+            super::rule_defaults::project_mask(&mut snapshot, node.rule_default_mask())?;
             class_name_from_path = Some(snapshot.class_name);
 
             // Properties from the snapshot are pulled in unchanged, and
@@ -169,12 +293,12 @@ pub fn snapshot_project_node(
         }
 
         (Some(project), Some(path), _, _) => {
-            if path == "Folder" {
+            if path == "Folder" || project == path {
                 project
             } else {
                 bail!(
                     "ClassName for Instance \"{}\" was specified in both the project file (as \"{}\") and from the filesystem (as \"{}\").\n\
-                     If $className and $path are both set, $path must refer to a Folder.
+                     If $className and $path are both set, their classes must match or $path must refer to a Folder.
                      \n\
                      Project path: {}\n\
                      Filesystem path: {}\n",
@@ -203,6 +327,10 @@ pub fn snapshot_project_node(
             );
         }
 
+        (_, None, _, Some(PathNode::Multiple(_))) => {
+            unreachable!("array snapshots always have a root")
+        }
+
         (None, None, None, None) => {
             bail!(
                 "Instance \"{}\" is missing some required information.\n\
@@ -219,6 +347,15 @@ pub fn snapshot_project_node(
     };
 
     for (child_name, child_project_node) in &node.children {
+        if matches!(node.path, Some(PathNode::Multiple(_))) {
+            if let Some(child) = children.iter().find(|child| child.name == *child_name) {
+                bail!(
+                    "Explicit project child {child_name} in {} conflicts with array source {:?}",
+                    project_path.display(),
+                    child.metadata.instigating_source
+                );
+            }
+        }
         if let Some(child) = snapshot_project_node(
             context,
             project_path,
@@ -260,7 +397,14 @@ pub fn snapshot_project_node(
     }
 
     if !node.attributes.is_empty() {
-        let mut attributes = Attributes::new();
+        let mut attributes = if metadata.rule_defaults.is_some() {
+            match properties.get(&ustr("Attributes")) {
+                Some(Variant::Attributes(attrs)) => attrs.clone(),
+                _ => Attributes::new(),
+            }
+        } else {
+            Attributes::new()
+        };
 
         for (key, unresolved) in &node.attributes {
             let value = unresolved.clone().resolve_unambiguous().with_context(|| {
@@ -294,15 +438,29 @@ pub fn snapshot_project_node(
         metadata.specified_id = Some(RojoRef::new(id.clone()))
     }
 
+    if let Some(state) = &mut metadata.rule_defaults {
+        state
+            .explicit_properties
+            .extend(node.properties.keys().copied());
+        state
+            .explicit_attributes
+            .extend(node.attributes.keys().cloned());
+        state.explicit_class |= node.class_name.is_some();
+        state.explicit_ignore = node.ignore_unknown_instances.or(state.explicit_ignore);
+    }
+
+    // Re-snapshotting must reapply this node's current option, rather than
+    // remembering an override that may have been removed from the project.
+    metadata.context.ignore_unknown_descendants = incoming_policy;
     metadata.instigating_source = Some(InstigatingSource::ProjectNode {
         path: project_path.to_path_buf(),
         name: instance_name.to_string(),
-        node: node.clone(),
+        node: Box::new(node.clone()),
         parent_class: parent_class.map(|name| name.to_owned()),
     });
 
     Ok(Some(InstanceSnapshot {
-        snapshot_id: Ref::none(),
+        snapshot_id,
         name,
         class_name,
         properties,
@@ -403,13 +561,15 @@ pub fn syncback_project<'sync>(
                     .middleware(middleware),
             );
 
-            ref_to_path_map.insert(new_inst.referent(), full_path);
-
             // We only want to set properties if it needs it.
             if !middleware.handles_own_properties() {
+                let property_snapshot = snapshot
+                    .with_new_path(full_path.clone(), new_inst.referent(), Some(old_inst.id()))
+                    .middleware(middleware);
                 removed_stale_properties |=
-                    project_node_property_syncback_path(snapshot, new_inst, node);
+                    project_node_property_syncback_path(&property_snapshot, new_inst, node)?;
             }
+            ref_to_path_map.insert(new_inst.referent(), full_path);
         } else {
             removed_stale_properties |=
                 project_node_property_syncback_no_path(snapshot, new_inst, node);
@@ -419,6 +579,11 @@ pub fn syncback_project<'sync>(
             let child = snapshot
                 .get_new_instance(*child_ref)
                 .expect("all children of Instances should be in new DOM");
+            // Without a source path, only explicitly declared children belong
+            // to this project. Studio-only siblings must not affect matching.
+            if node.path.is_none() && !node.children.contains_key(&child.name) {
+                continue;
+            }
             if new_child_map.insert(&child.name, child).is_some() {
                 anyhow::bail!(
                     "Instances that are direct children of an Instance that is made by a project file \
@@ -496,11 +661,9 @@ pub fn syncback_project<'sync>(
                 let parent_middleware =
                     Middleware::middleware_for_path(vfs, &project.sync_rules, &parent_path)?
                         .expect("project nodes should have a middleware if they have children.");
-                // If this node points directly to a project, it may still have
-                // children but they'll be handled by syncback. This isn't a
-                // concern with directories because they're singular things,
-                // files that contain their own children.
-                if parent_middleware != Middleware::Project {
+                // Project and model files serialize their descendants themselves.
+                // Scheduling a new child again would write a path inside a file.
+                if !parent_middleware.handles_own_properties() {
                     descendant_snapshots.push(snapshot.with_base_path(
                         &parent_path,
                         new_child.referent(),
@@ -609,11 +772,67 @@ fn project_node_property_syncback_path(
     snapshot: &SyncbackSnapshot,
     new_inst: &Instance,
     node: &mut ProjectNode,
-) -> bool {
-    let filtered_properties = snapshot
+) -> anyhow::Result<bool> {
+    if super::rule_defaults::syncback_state(snapshot)?.is_some() {
+        let original = node.clone();
+        let mut properties = indexmap::IndexMap::new();
+        let mut attributes = indexmap::IndexMap::new();
+        for (key, value) in snapshot
+            .get_path_filtered_properties(new_inst.referent())
+            .unwrap()
+        {
+            match value {
+                Variant::Attributes(attrs) => {
+                    for (key, value) in attrs.iter().filter(|(key, _)| !key.starts_with("RBX")) {
+                        attributes.insert(
+                            key.clone(),
+                            UnresolvedValue::from_variant_unambiguous(value.clone()),
+                        );
+                    }
+                }
+                _ => {
+                    properties.insert(
+                        key,
+                        UnresolvedValue::from_variant(value.clone(), &new_inst.class, &key),
+                    );
+                }
+            }
+        }
+        let mut mask = node.rule_default_mask().clone();
+        super::rule_defaults::rewrite_metadata(
+            snapshot,
+            &mut properties,
+            &mut attributes,
+            &mut mask,
+            &mut node.ignore_unknown_instances,
+        )?;
+        node.rule_defaults = (!mask.is_empty()).then(|| Box::new(mask));
+        let context = super::lua::project_run_context(snapshot)?;
+        if let Some(value) = context {
+            properties.insert(
+                "RunContext".into(),
+                UnresolvedValue::from_variant_unambiguous(value),
+            );
+        }
+        node.properties = properties.into_iter().collect();
+        node.attributes = attributes.into_iter().collect();
+        return Ok(*node != original);
+    }
+    let mut filtered_properties = snapshot
         .get_path_filtered_properties(new_inst.referent())
         .unwrap();
-    project_node_property_syncback(snapshot, filtered_properties, new_inst, node)
+    // A native source's default may differ from the engine default stripped by
+    // filtering, so keep that override in the existing project property map.
+    let context = super::lua::project_run_context(snapshot)?;
+    if let Some(value) = &context {
+        filtered_properties.insert("RunContext".into(), value);
+    }
+    Ok(project_node_property_syncback(
+        snapshot,
+        filtered_properties,
+        new_inst,
+        node,
+    ))
 }
 
 fn project_node_property_syncback_no_path(
@@ -630,6 +849,16 @@ fn project_node_should_reserialize(
     node_attributes: &BTreeMap<String, UnresolvedValue>,
     instance: InstanceWithMeta,
 ) -> anyhow::Result<bool> {
+    if instance.metadata().rule_defaults.is_some()
+        && instance
+            .metadata()
+            .middleware
+            .is_some_and(|m| !m.handles_own_properties())
+    {
+        // Rule-aware path syncback already compared the complete explicit node,
+        // including removals/masks. Shared attributes are not project overrides.
+        return Ok(false);
+    }
     for (prop_name, unresolved_node_value) in node_properties {
         if let Some(inst_value) = instance.properties().get(prop_name) {
             let node_value = unresolved_node_value
@@ -707,9 +936,448 @@ fn infer_class_name(name: &str, parent_class: Option<&str>) -> Option<Ustr> {
 // #[cfg(feature = "broken-tests")]
 #[cfg(test)]
 mod test {
+    #[test]
+    fn project_path_layers_preserve_model_root_reference_identity() {
+        use crate::snapshot::{apply_patch_set, compute_patch_set, RojoTree};
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.insert(
+            dom.root_ref(),
+            InstanceBuilder::new("ObjectValue").with_name("StoredRoot"),
+        );
+        dom.get_by_ref_mut(root)
+            .unwrap()
+            .properties
+            .insert(ustr("Value"), Variant::Ref(root));
+        dom.insert(
+            root,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("ToRoot")
+                .with_property("Value", root),
+        );
+        let target = dom.insert(root, InstanceBuilder::new("Part").with_name("Target"));
+        dom.insert(
+            root,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("ToSibling")
+                .with_property("Value", target),
+        );
+        let mut binary = Vec::new();
+        crate::binary_serialization::to_writer(&mut binary, &dom, &[root]).unwrap();
+        let mut xml = Vec::new();
+        rbx_xml::to_writer(&mut xml, &dom, &[root], rbx_xml::EncodeOptions::new()).unwrap();
+        for (file, bytes) in [("model.rbxm", binary), ("model.rbxmx", xml)] {
+            let vfs = Vfs::new(InMemoryFs::new());
+            vfs.set_watch_enabled(false);
+            vfs.create_dir_all("/project").unwrap();
+            vfs.write(format!("/project/{file}"), bytes).unwrap();
+            vfs.write(
+                "/project/inner.project.json",
+                serde_json::json!({"name":"Inner","tree":{"$path":file}}).to_string(),
+            )
+            .unwrap();
+            vfs.write("/project/default.project.json",r#"{"name":"Root","tree":{"$className":"Folder","A":{"$path":"inner.project.json"},"B":{"$path":"inner.project.json"}}}"#).unwrap();
+            let mut tree = RojoTree::new(InstanceSnapshot::new());
+            let live_root = tree.get_root_id();
+            for _ in 0..2 {
+                let snapshot = snapshot_from_vfs(
+                    &InstanceContext::default(),
+                    &vfs,
+                    "/project/default.project.json".as_ref(),
+                )
+                .unwrap();
+                let patch = compute_patch_set(snapshot, &tree, live_root);
+                apply_patch_set(&mut tree, patch);
+                for name in ["A", "B"] {
+                    let model = tree
+                        .descendants(live_root)
+                        .find(|node| node.name() == name)
+                        .unwrap();
+                    assert_eq!(
+                        model.properties().get(&ustr("Value")),
+                        Some(&Variant::Ref(model.id())),
+                        "{file}/{name} self reference"
+                    );
+                    let children: std::collections::HashMap<_, _> = model
+                        .children()
+                        .iter()
+                        .map(|id| {
+                            let child = tree.get_instance(*id).unwrap();
+                            (child.name().to_owned(), *id)
+                        })
+                        .collect();
+                    assert_eq!(
+                        tree.get_instance(children["ToRoot"])
+                            .unwrap()
+                            .properties()
+                            .get(&ustr("Value")),
+                        Some(&Variant::Ref(model.id())),
+                        "{file}/{name} child-to-root reference"
+                    );
+                    assert_eq!(
+                        tree.get_instance(children["ToSibling"])
+                            .unwrap()
+                            .properties()
+                            .get(&ustr("Value")),
+                        Some(&Variant::Ref(children["Target"])),
+                        "{file}/{name} sibling reference"
+                    );
+                }
+            }
+        }
+    }
     use super::*;
 
     use memofs::{InMemoryFs, VfsSnapshot};
+
+    #[test]
+    fn identical_project_and_metadata_classes_are_not_conflicts() {
+        for class in ["StarterPlayerScripts", "StarterCharacterScripts", "Part"] {
+            let mut fs = InMemoryFs::new();
+            fs.load_snapshot(
+                "/project",
+                VfsSnapshot::dir([
+                    (
+                        "default.project.json",
+                        VfsSnapshot::file(format!(
+                            r#"{{"name":"Root","tree":{{"$className":"{class}","$path":"src"}}}}"#
+                        )),
+                    ),
+                    (
+                        "src",
+                        VfsSnapshot::dir([
+                            (
+                                "init.meta.json",
+                                VfsSnapshot::file(format!(
+                                    r#"{{"className":"{class}","ignoreUnknownInstances":true}}"#
+                                )),
+                            ),
+                            ("child.luau", VfsSnapshot::file("return 42")),
+                        ]),
+                    ),
+                ]),
+            )
+            .unwrap();
+            let snapshot = snapshot_from_vfs(
+                &InstanceContext::new(),
+                &Vfs::new(fs),
+                Path::new("/project/default.project.json"),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(snapshot.class_name.as_str(), class);
+            assert!(snapshot.metadata.ignore_unknown_instances);
+            assert_eq!(snapshot.children.len(), 1);
+            assert_eq!(snapshot.children[0].name, "child");
+        }
+    }
+
+    #[test]
+    fn different_project_and_metadata_classes_still_report_both_paths() {
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/project",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(
+                        r#"{"name":"Root","tree":{"$className":"Part","$path":"src"}}"#,
+                    ),
+                ),
+                (
+                    "src",
+                    VfsSnapshot::dir([(
+                        "init.meta.json",
+                        VfsSnapshot::file(r#"{"className":"Model"}"#),
+                    )]),
+                ),
+            ]),
+        )
+        .unwrap();
+        let error = snapshot_from_vfs(
+            &InstanceContext::new(),
+            &Vfs::new(fs),
+            Path::new("/project/default.project.json"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Part") && error.contains("Model"));
+        assert!(error.contains("/project/default.project.json") && error.contains("src"));
+    }
+
+    #[test]
+    fn unknown_descendants_subtree_options_preserve_legacy_node_defaults() {
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot("/project", VfsSnapshot::dir([
+            ("default.project.json", VfsSnapshot::file(r#"{"name":"Root","tree":{
+                "$className":"Folder",
+                "OptIn":{"$path":"src","$ignoreUnknownDescendants":true},
+                "Default":{"$path":"src"},
+                "Strict":{"$className":"Folder","$ignoreUnknownDescendants":false,"Mapped":{"$path":"src"}},
+                "OwnTrue":{"$path":"src","$ignoreUnknownInstances":true}
+            }}"#)),
+            ("src", VfsSnapshot::dir([("child.luau", VfsSnapshot::file("return 1"))])),
+        ])).unwrap();
+        let snapshot = snapshot_from_vfs(
+            &InstanceContext::new(),
+            &Vfs::new(fs),
+            Path::new("/project/default.project.json"),
+        )
+        .unwrap()
+        .unwrap();
+        let child = |name: &str| {
+            snapshot
+                .children
+                .iter()
+                .find(|child| child.name == name)
+                .unwrap()
+        };
+        assert!(snapshot.metadata.ignore_unknown_instances);
+        assert!(child("OptIn").children[0].metadata.ignore_unknown_instances);
+        assert!(!child("Default").metadata.ignore_unknown_instances);
+        assert!(
+            !child("Default").children[0]
+                .metadata
+                .ignore_unknown_instances
+        );
+        assert!(child("Strict").metadata.ignore_unknown_instances);
+        assert!(
+            !child("Strict").children[0]
+                .metadata
+                .ignore_unknown_instances
+        );
+        assert!(child("OwnTrue").metadata.ignore_unknown_instances);
+        assert!(
+            !child("OwnTrue").children[0]
+                .metadata
+                .ignore_unknown_instances
+        );
+    }
+
+    #[test]
+    fn unknown_descendants_reload_does_not_remember_removed_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("default.project.json");
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/child.luau"), "return 1").unwrap();
+        let mut context = InstanceContext::new();
+        for policy in [Some(true), Some(false), None, Some(true), None] {
+            let mut tree = serde_json::json!({"$path":"src"});
+            if let Some(policy) = policy {
+                tree["$ignoreUnknownDescendants"] = policy.into();
+            }
+            std::fs::write(
+                &project,
+                serde_json::to_vec(&serde_json::json!({"name":"Root","tree":tree})).unwrap(),
+            )
+            .unwrap();
+            // Fresh VFS content, but the exact context used by live resnapshots.
+            let vfs = Vfs::new(memofs::StdBackend::new().unwrap());
+            let snapshot = snapshot_from_vfs(&context, &vfs, &project)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                snapshot.metadata.ignore_unknown_instances,
+                policy == Some(true)
+            );
+            assert_eq!(
+                snapshot.children[0].metadata.ignore_unknown_instances,
+                policy == Some(true)
+            );
+            context = snapshot.metadata.context;
+            assert_eq!(context.ignore_unknown_descendants, None);
+        }
+
+        context.ignore_unknown_descendants = Some(true);
+        for policy in [Some(false), None, Some(true), None] {
+            let mut node: ProjectNode = crate::json::from_str(r#"{"$path":"src"}"#).unwrap();
+            node.ignore_unknown_descendants = policy;
+            let snapshot = snapshot_project_node(
+                &context,
+                &project,
+                "Subtree",
+                &node,
+                &Vfs::new(memofs::StdBackend::new().unwrap()),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                snapshot.children[0].metadata.ignore_unknown_instances,
+                policy != Some(false)
+            );
+            context = snapshot.metadata.context;
+            assert_eq!(context.ignore_unknown_descendants, Some(true));
+        }
+    }
+
+    #[test]
+    fn unknown_descendants_reach_binary_and_xml_model_children() {
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+        let dom = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("Folder")
+                    .with_child(InstanceBuilder::new("Folder").with_name("Embedded")),
+            ),
+        );
+        let mut binary = Vec::new();
+        crate::binary_serialization::to_writer(&mut binary, &dom, dom.root().children()).unwrap();
+        let mut xml = Vec::new();
+        rbx_xml::to_writer(
+            &mut xml,
+            &dom,
+            dom.root().children(),
+            rbx_xml::EncodeOptions::new(),
+        )
+        .unwrap();
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/models",
+            VfsSnapshot::dir([
+                ("binary.rbxm", VfsSnapshot::file(binary)),
+                ("xml.rbxmx", VfsSnapshot::file(xml)),
+            ]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(fs);
+        let mut context = InstanceContext::new();
+        for policy in [None, Some(true), Some(false)] {
+            context.ignore_unknown_descendants = policy;
+            for path in ["/models/binary.rbxm", "/models/xml.rbxmx"] {
+                let snapshot = snapshot_from_vfs(&context, &vfs, Path::new(path))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    snapshot.metadata.ignore_unknown_instances,
+                    policy == Some(true)
+                );
+                assert_eq!(
+                    snapshot.children[0].metadata.ignore_unknown_instances,
+                    policy == Some(true)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_descendants_inherit_without_overriding_explicit_metadata() {
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot("/project", VfsSnapshot::dir([
+            ("default.project.json", VfsSnapshot::file(r#"{"name":"Root","tree":{
+                "$path":"src","$ignoreUnknownDescendants":true,
+                "Strict":{"$path":"strict","$ignoreUnknownDescendants":false},
+                "OwnFalse":{"$path":"own","$ignoreUnknownInstances":false},
+                "Nested":{"$path":"nested.project.json"}
+            }}"#)),
+            ("src", VfsSnapshot::dir([
+                ("child.luau", VfsSnapshot::file("return 1")),
+                ("child.meta.json", VfsSnapshot::file(r#"{"ignoreUnknownInstances":false}"#)),
+                ("model.model.json", VfsSnapshot::file(r#"{"className":"Folder","children":[{"name":"Embedded","className":"Folder"}]}"#)),
+                ("directory", VfsSnapshot::dir([
+                    ("init.meta.json", VfsSnapshot::file(r#"{"ignoreUnknownInstances":false}"#)),
+                    ("grandchild.luau", VfsSnapshot::file("return 2")),
+                ])),
+            ])),
+            ("strict", VfsSnapshot::dir([("child.luau", VfsSnapshot::file("return 3"))])),
+            ("own", VfsSnapshot::dir([("child.luau", VfsSnapshot::file("return 4"))])),
+            ("nested.project.json", VfsSnapshot::file(r#"{"name":"Nested","tree":{"$path":"strict"}}"#)),
+        ])).unwrap();
+        let vfs = Vfs::new(fs);
+        let snapshot = snapshot_from_vfs(
+            &InstanceContext::new(),
+            &vfs,
+            Path::new("/project/default.project.json"),
+        )
+        .unwrap()
+        .unwrap();
+        let child = |name: &str| {
+            snapshot
+                .children
+                .iter()
+                .find(|child| child.name == name)
+                .unwrap()
+        };
+        assert!(snapshot.metadata.ignore_unknown_instances);
+        assert!(!child("child").metadata.ignore_unknown_instances);
+        assert!(!child("directory").metadata.ignore_unknown_instances);
+        assert!(
+            child("directory").children[0]
+                .metadata
+                .ignore_unknown_instances
+        );
+        assert!(child("model").metadata.ignore_unknown_instances);
+        assert!(child("model").children[0].metadata.ignore_unknown_instances);
+        assert!(!child("Strict").metadata.ignore_unknown_instances);
+        assert!(
+            !child("Strict").children[0]
+                .metadata
+                .ignore_unknown_instances
+        );
+        assert!(!child("OwnFalse").metadata.ignore_unknown_instances);
+        assert!(
+            child("OwnFalse").children[0]
+                .metadata
+                .ignore_unknown_instances
+        );
+        assert!(
+            child("Nested").children[0]
+                .metadata
+                .ignore_unknown_instances
+        );
+    }
+
+    #[test]
+    fn indirect_project_cycles_report_the_chain_and_clear_traversal_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.project.json");
+        let second = dir.path().join("second.project.json");
+        std::fs::write(
+            &first,
+            r#"{"name":"First","tree":{"$path":"second.project.json"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            r#"{"name":"Second","tree":{"$path":"./first.project.json"}}"#,
+        )
+        .unwrap();
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let context = InstanceContext::default();
+        let error = snapshot_from_vfs(&context, &vfs, &first).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("Circular project reference"), "{message}");
+        assert!(message.contains("first.project.json"), "{message}");
+        assert!(message.contains("second.project.json"), "{message}");
+        vfs.write(
+            &second,
+            r#"{"name":"Second","tree":{"$className":"Folder"}}"#,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let snapshot = snapshot_from_vfs(&context, &vfs, &first).unwrap().unwrap();
+            assert_eq!(snapshot.class_name, "Folder");
+        }
+    }
+
+    #[test]
+    fn independent_project_aliases_are_not_cycles() {
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot("/project", VfsSnapshot::dir([
+            ("root.project.json", VfsSnapshot::file(r#"{"name":"Root","tree":{"$className":"Folder","First":{"$path":"leaf.project.json"},"Second":{"$path":"leaf.project.json"}}}"#)),
+            ("leaf.project.json", VfsSnapshot::file(r#"{"name":"Leaf","tree":{"$className":"Folder"}}"#)),
+        ])).unwrap();
+        let vfs = Vfs::new(fs);
+        let snapshot = snapshot_from_vfs(
+            &InstanceContext::default(),
+            &vfs,
+            Path::new("/project/root.project.json"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot.children.len(), 2);
+        assert_ne!(snapshot.children[0].name, snapshot.children[1].name);
+    }
 
     #[ignore = "Functionality moved to root snapshot middleware"]
     #[test]

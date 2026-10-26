@@ -8,20 +8,25 @@ use std::{
 };
 
 use rbx_dom_weak::{
-    types::{Ref, Variant, VariantType},
+    types::{Ref, Variant},
     Ustr, UstrMap,
 };
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
-use crate::{
-    session_id::SessionId,
-    snapshot::{
-        AppliedPatchSet, InstanceMetadata as RojoInstanceMetadata, InstanceWithMeta, RojoTree,
-    },
+use crate::session_id::SessionId;
+#[cfg(any(feature = "cli", test))]
+use crate::snapshot::InstanceMetadata as RojoInstanceMetadata;
+#[cfg(feature = "cli")]
+use crate::snapshot::InstanceWithMeta;
+#[cfg(any(feature = "cli", test))]
+use {
+    crate::snapshot::{AppliedPatchInstance, AppliedPatchSet},
+    rbx_dom_weak::types::VariantType,
 };
 
 /// Server version to report over the API, not exposed outside this crate.
+#[cfg(feature = "cli")]
 pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Current protocol version, which is required to match.
@@ -36,23 +41,19 @@ pub struct SubscribeMessage<'a> {
     pub updated: Vec<InstanceUpdate>,
 }
 
+#[cfg(any(feature = "cli", test))]
 impl<'a> SubscribeMessage<'a> {
-    pub(crate) fn from_patch_update(tree: &'a RojoTree, patch: AppliedPatchSet) -> Self {
-        let removed = patch.removed;
-
-        let mut added = HashMap::new();
-        for id in patch.added {
-            let instance = tree.get_instance(id).unwrap();
-            added.insert(id, Instance::from_rojo_instance(instance));
-
-            for instance in tree.descendants(id) {
-                added.insert(instance.id(), Instance::from_rojo_instance(instance));
-            }
-        }
+    pub(crate) fn from_patch_update(patch: &'a AppliedPatchSet) -> Self {
+        let removed = patch.removed.clone();
+        let added = patch
+            .added_instances
+            .iter()
+            .map(|(&id, instance)| (id, Instance::from_applied_instance(id, instance)))
+            .collect();
 
         let updated = patch
             .updated
-            .into_iter()
+            .iter()
             .map(|update| {
                 let changed_metadata = update
                     .changed_metadata
@@ -61,13 +62,14 @@ impl<'a> SubscribeMessage<'a> {
 
                 let changed_properties = update
                     .changed_properties
-                    .into_iter()
+                    .iter()
                     .filter(|(_key, value)| property_filter(value.as_ref()))
+                    .map(|(&key, value)| (key, value.clone()))
                     .collect();
 
                 InstanceUpdate {
                     id: update.id,
-                    changed_name: update.changed_name,
+                    changed_name: update.changed_name.clone(),
                     changed_class_name: update.changed_class_name,
                     changed_properties,
                     changed_metadata,
@@ -103,6 +105,7 @@ pub struct InstanceMetadata {
     pub ignore_unknown_instances: bool,
 }
 
+#[cfg(any(feature = "cli", test))]
 impl InstanceMetadata {
     pub(crate) fn from_rojo_metadata(meta: &RojoInstanceMetadata) -> Self {
         Self {
@@ -124,6 +127,27 @@ pub struct Instance<'a> {
 }
 
 impl Instance<'_> {
+    #[cfg(any(feature = "cli", test))]
+    fn from_applied_instance(id: Ref, source: &AppliedPatchInstance) -> Instance<'_> {
+        Instance {
+            id,
+            parent: source.parent,
+            name: Cow::Borrowed(&source.name),
+            class_name: source.class_name,
+            properties: source
+                .properties
+                .iter()
+                .filter(|(_key, value)| property_filter(Some(value)))
+                .map(|(&key, value)| (key, Cow::Borrowed(value)))
+                .collect(),
+            children: Cow::Borrowed(&source.children),
+            metadata: Some(InstanceMetadata {
+                ignore_unknown_instances: source.ignore_unknown_instances,
+            }),
+        }
+    }
+
+    #[cfg(feature = "cli")]
     pub(crate) fn from_rojo_instance(source: InstanceWithMeta<'_>) -> Instance<'_> {
         let properties = source
             .properties()
@@ -144,6 +168,7 @@ impl Instance<'_> {
     }
 }
 
+#[cfg(any(feature = "cli", test))]
 fn property_filter(value: Option<&Variant>) -> bool {
     let ty = value.map(|value| value.ty());
 
@@ -311,4 +336,115 @@ pub enum ErrorResponseKind {
     BadRequest,
     Forbidden,
     InternalError,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::snapshot::{
+        apply_patch_set, InstanceSnapshot, PatchAdd, PatchSet, PatchUpdate, RojoTree,
+    };
+    use rbx_dom_weak::ustr;
+
+    fn add(tree: &mut RojoTree, parent_id: Ref, instance: InstanceSnapshot) -> AppliedPatchSet {
+        apply_patch_set(
+            tree,
+            PatchSet {
+                added_instances: vec![PatchAdd {
+                    parent_id,
+                    instance,
+                }],
+                ..PatchSet::new()
+            },
+        )
+    }
+
+    #[test]
+    fn delayed_addition_survives_subtree_deletion() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new().name("Root").class_name("Folder"));
+        let root = tree.get_root_id();
+        let first = add(
+            &mut tree,
+            root,
+            InstanceSnapshot::new()
+                .name("Folder")
+                .class_name("Folder")
+                .children(vec![InstanceSnapshot::new()
+                    .name("Child")
+                    .class_name("ModuleScript")
+                    .property("Source", "return 1")]),
+        );
+        let folder = first.added[0];
+        let child = tree.get_instance(folder).unwrap().children()[0];
+        apply_patch_set(
+            &mut tree,
+            PatchSet {
+                removed_instances: vec![folder],
+                ..PatchSet::new()
+            },
+        );
+        let message = SubscribeMessage::from_patch_update(&first);
+        assert_eq!(message.added.len(), 2);
+        assert_eq!(message.added[&folder].parent, root);
+        assert_eq!(message.added[&child].parent, folder);
+        assert_eq!(message.added[&child].name, "Child");
+    }
+
+    #[test]
+    fn delayed_addition_keeps_its_original_source() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new().name("Root").class_name("Folder"));
+        let root = tree.get_root_id();
+        let first = add(
+            &mut tree,
+            root,
+            InstanceSnapshot::new()
+                .name("Script")
+                .class_name("ModuleScript")
+                .property("Source", "return 1"),
+        );
+        let id = first.added[0];
+        apply_patch_set(
+            &mut tree,
+            PatchSet {
+                updated_instances: vec![PatchUpdate {
+                    id,
+                    changed_name: None,
+                    changed_class_name: None,
+                    changed_metadata: None,
+                    changed_properties: [(
+                        ustr("Source"),
+                        Some(Variant::String("return 2".into())),
+                    )]
+                    .into_iter()
+                    .collect(),
+                }],
+                ..PatchSet::new()
+            },
+        );
+        let message = SubscribeMessage::from_patch_update(&first);
+        assert_eq!(
+            message.added[&id].properties[&ustr("Source")].as_ref(),
+            &Variant::String("return 1".into())
+        );
+    }
+
+    #[test]
+    fn delayed_addition_excludes_children_created_in_later_patches() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new().name("Root").class_name("Folder"));
+        let root = tree.get_root_id();
+        let first = add(
+            &mut tree,
+            root,
+            InstanceSnapshot::new().name("Folder").class_name("Folder"),
+        );
+        let folder = first.added[0];
+        add(
+            &mut tree,
+            folder,
+            InstanceSnapshot::new().name("Later").class_name("Folder"),
+        );
+        let message = SubscribeMessage::from_patch_update(&first);
+        assert_eq!(message.added.len(), 1);
+        assert!(message.added[&folder].children.is_empty());
+    }
 }

@@ -115,7 +115,12 @@ local function diff(instanceMap, virtualInstances, rootId)
 				if err.kind == Error.UnknownProperty then
 					Log.trace("Skipping unknown property {}.{}", err.details.className, err.details.propertyName)
 				else
-					Log.trace("Skipping unreadable property {}.{}", err.details.className, err.details.propertyName)
+					Log.warn(
+						"Skipping live sync of {}.{}: its current value cannot be read ({}). For serialization-only properties, build the place file instead.",
+						instance:GetFullName(),
+						propertyName,
+						err.kind
+					)
 				end
 			end
 		end
@@ -136,7 +141,18 @@ local function diff(instanceMap, virtualInstances, rootId)
 		for _, childInstance in ipairs(instance:GetChildren()) do
 			local childId = instanceMap.fromInstances[childInstance]
 
-			if childId == nil then
+			if childId ~= nil and virtualInstances[childId] == nil then
+				-- This was managed by the same server before disconnecting and
+				-- has since been deleted. It is not an unknown Studio instance.
+				table.insert(patch.removed, childId)
+			elseif childId == nil then
+				-- Studio owns its active editor camera. Removing it recreates the
+				-- camera at another viewpoint when a managed Workspace connects.
+				-- Known cameras still follow the project's updates and deletions.
+				if instance:IsA("Workspace") and childInstance == instance.CurrentCamera then
+					continue
+				end
+
 				-- pcall to avoid security permission errors
 				local success, skip = pcall(function()
 					-- We don't remove instances that aren't going to be saved anyway,

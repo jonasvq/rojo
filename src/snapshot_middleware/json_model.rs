@@ -31,8 +31,15 @@ pub fn snapshot_json_model(
         return Ok(None);
     }
 
-    let mut instance: JsonModel = json::from_str_with_context(contents_str, || {
+    let value = json::parse_value_with_context(contents_str, || {
         format!("File is not a valid JSON model: {}", path.display())
+    })?;
+    warn_unknown_model_fields(&value, path, "$");
+    let mut instance: JsonModel = serde_json::from_value(value).with_context(|| {
+        format!(
+            "File is not a valid JSON model: {}: Invalid JSON structure",
+            path.display()
+        )
     })?;
 
     if let Some(top_level_name) = &instance.name {
@@ -56,6 +63,8 @@ pub fn snapshot_json_model(
         .into_snapshot()
         .with_context(|| format!("Could not load JSON model: {}", path.display()))?;
 
+    snapshot.inherit_model_context(context);
+
     snapshot.metadata = snapshot
         .metadata
         .instigating_source(path)
@@ -65,6 +74,34 @@ pub fn snapshot_json_model(
         .schema(schema);
 
     Ok(Some(snapshot))
+}
+
+fn warn_unknown_model_fields(value: &serde_json::Value, path: &Path, location: &str) {
+    json::warn_unknown_fields(
+        value,
+        &[
+            "$schema",
+            "name",
+            "Name",
+            "className",
+            "ClassName",
+            "id",
+            "children",
+            "Children",
+            "properties",
+            "Properties",
+            "attributes",
+        ],
+        path,
+        location,
+    );
+    for field in ["children", "Children"] {
+        if let Some(children) = value.get(field).and_then(serde_json::Value::as_array) {
+            for (index, child) in children.iter().enumerate() {
+                warn_unknown_model_fields(child, path, &format!("{location}.{field}[{index}]"));
+            }
+        }
+    }
 }
 
 pub fn syncback_json_model<'sync>(
@@ -83,11 +120,22 @@ pub fn syncback_json_model<'sync>(
         model.schema = old_inst.metadata().schema.clone();
     }
 
+    let mut mask = crate::project::RuleDefaultMask::default();
+    super::rule_defaults::rewrite_metadata(
+        snapshot,
+        &mut model.properties,
+        &mut model.attributes,
+        &mut mask,
+        &mut None,
+    )?;
+    let mut fs_snapshot = FsSnapshot::new().with_added_file(
+        &snapshot.path,
+        serde_json::to_vec_pretty(&model).context("failed to serialize new JSON Model")?,
+    );
+    super::rule_defaults::model_mask(snapshot, &mask, &mut fs_snapshot)?;
+
     Ok(SyncbackReturn {
-        fs_snapshot: FsSnapshot::new().with_added_file(
-            &snapshot.path,
-            serde_json::to_vec_pretty(&model).context("failed to serialize new JSON Model")?,
-        ),
+        fs_snapshot,
         children: Vec::new(),
         removed_children: Vec::new(),
     })
@@ -129,6 +177,10 @@ fn json_model_from_pair<'sync>(
             }
         }
     }
+
+    // Properties arrive from a hash map; serialize a stable lexical order.
+    properties.sort_by(|a, _, b, _| a.as_str().cmp(b.as_str()));
+    attributes.sort_keys();
 
     let mut children = Vec::with_capacity(new_inst.children().len());
 

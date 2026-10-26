@@ -6,15 +6,15 @@ use std::{
 };
 
 use rbx_dom_weak::{
-    types::{Ref, Variant},
-    ustr, Ustr,
+    types::{Attributes, Ref, Variant},
+    ustr,
 };
 
 use super::{
-    patch::{AppliedPatchSet, AppliedPatchUpdate, PatchSet, PatchUpdate},
+    patch::{AppliedPatchInstance, AppliedPatchSet, AppliedPatchUpdate, PatchSet, PatchUpdate},
     InstanceSnapshot, RojoTree,
 };
-use crate::{multimap::MultiMap, RojoRef, REF_ID_ATTRIBUTE_NAME, REF_POINTER_ATTRIBUTE_PREFIX};
+use crate::{RojoRef, REF_ID_ATTRIBUTE_NAME};
 
 /// Consumes the input `PatchSet`, applying all of its prescribed changes to the
 /// tree and returns an `AppliedPatchSet`, which can be used to keep another
@@ -25,8 +25,9 @@ pub fn apply_patch_set(tree: &mut RojoTree, patch_set: PatchSet) -> AppliedPatch
 
     {
         profiling::scope!("removals");
-        for removed_id in patch_set.removed_instances {
-            apply_remove_instance(&mut context, tree, removed_id);
+        if !patch_set.removed_instances.is_empty() {
+            tree.remove_many(&patch_set.removed_instances);
+            context.applied_patch_set.removed = patch_set.removed_instances;
         }
     }
 
@@ -76,11 +77,6 @@ struct PatchApplyContext {
     /// to be rewritten.
     has_refs_to_rewrite: HashSet<Ref>,
 
-    /// Tracks all ref properties that were specified using attributes. This has
-    /// to be handled after everything else is done just like normal referent
-    /// properties.
-    attribute_refs_to_rewrite: MultiMap<Ref, (Ustr, String)>,
-
     /// The current applied patch result, describing changes made to the tree.
     applied_patch_set: AppliedPatchSet,
 }
@@ -96,7 +92,10 @@ struct PatchApplyContext {
 /// where we build up a map of snapshot IDs to instance IDs as they're created,
 /// then apply properties all at once at the end.
 #[profiling::function]
-fn finalize_patch_application(context: PatchApplyContext, tree: &mut RojoTree) -> AppliedPatchSet {
+fn finalize_patch_application(
+    mut context: PatchApplyContext,
+    tree: &mut RojoTree,
+) -> AppliedPatchSet {
     for id in context.has_refs_to_rewrite {
         // This should always succeed since instances marked as added in our
         // patch should be added without fail.
@@ -113,28 +112,122 @@ fn finalize_patch_application(context: PatchApplyContext, tree: &mut RojoTree) -
         }
     }
 
-    // This is to get around the fact that `RojoTre::get_specified_id` borrows
-    // the tree as immutable, but we need to hold a mutable reference to it.
-    // Not exactly elegant, but it does the job.
-    let mut real_rewrites = Vec::new();
-    for (id, map) in context.attribute_refs_to_rewrite {
-        for (prop_name, prop_value) in map {
-            if let Some(target) = tree.get_specified_id(&RojoRef::new(prop_value)) {
-                real_rewrites.push((prop_name, Variant::Ref(target)))
+    let added: HashSet<_> = context.applied_patch_set.added.iter().copied().collect();
+    let mut update_indices: HashMap<_, _> = context
+        .applied_patch_set
+        .updated
+        .iter()
+        .enumerate()
+        .map(|(index, update)| (update.id, index))
+        .collect();
+    for (id, targets) in tree.take_dirty_attribute_references() {
+        for (property, target) in targets {
+            let desired = tree.get_specified_id(&target).map(Variant::Ref);
+            let Some(instance) = tree.get_instance(id) else {
+                continue;
+            };
+            if instance.properties().get(&property) == desired.as_ref() {
+                continue;
+            }
+            let mut instance = tree
+                .get_instance_mut(id)
+                .expect("reference owner disappeared during resolution");
+            match &desired {
+                Some(value) => {
+                    instance.properties_mut().insert(property, value.clone());
+                }
+                None => {
+                    instance.properties_mut().remove(&property);
+                }
+            }
+            // New instances are captured below after every reference is resolved.
+            if !added.contains(&id) {
+                let index = *update_indices.entry(id).or_insert_with(|| {
+                    let index = context.applied_patch_set.updated.len();
+                    context
+                        .applied_patch_set
+                        .updated
+                        .push(AppliedPatchUpdate::new(id));
+                    index
+                });
+                context.applied_patch_set.updated[index]
+                    .changed_properties
+                    .insert(property, desired);
             }
         }
-        let mut instance = tree
-            .get_instance_mut(id)
-            .expect("Invalid instance ID in deferred attribute ref map");
-        instance.properties_mut().extend(real_rewrites.drain(..));
+    }
+    // Applied patches describe the final tree, including rewritten IDs and
+    // references resolved after the original update was applied.
+    for update in &mut context.applied_patch_set.updated {
+        let instance = tree
+            .get_instance(update.id)
+            .expect("updated instance disappeared before publication");
+        for (property, value) in &mut update.changed_properties {
+            let actual = instance.properties().get(property);
+            if value.as_ref() != actual {
+                *value = actual.cloned();
+            }
+        }
     }
 
+    let added_instances = context
+        .applied_patch_set
+        .added
+        .iter()
+        .map(|&id| {
+            let instance = tree
+                .get_instance(id)
+                .expect("newly added instance missing before patch publication");
+            (
+                id,
+                AppliedPatchInstance {
+                    parent: instance.parent(),
+                    name: instance.name().to_owned(),
+                    class_name: instance.class_name(),
+                    properties: instance.properties().clone(),
+                    children: instance.children().to_vec(),
+                    ignore_unknown_instances: instance.metadata().ignore_unknown_instances,
+                },
+            )
+        })
+        .collect();
+    // Subscribers and history share immutable additions rather than cloning
+    // every source string each time the queue is read.
+    context.applied_patch_set.added_instances = std::sync::Arc::new(added_instances);
+    context.applied_patch_set.class_authority = std::sync::Arc::new(
+        context
+            .applied_patch_set
+            .added
+            .iter()
+            .copied()
+            .chain(
+                context
+                    .applied_patch_set
+                    .updated
+                    .iter()
+                    .map(|update| update.id),
+            )
+            .filter_map(|id| {
+                tree.get_instance(id).map(|node| {
+                    let policy = if let Some(authority) = node
+                        .metadata()
+                        .effective_sync_authority
+                        .as_ref()
+                        .filter(|authority| !authority.policies().is_empty())
+                    {
+                        authority
+                            .resolve(node.class_name().as_str())
+                            .map(|policy| policy.map(|policy| policy.properties))
+                            .map_err(|error| error.to_string())
+                    } else {
+                        Ok(None)
+                    };
+                    (id, policy)
+                })
+            })
+            .collect(),
+    );
     context.applied_patch_set
-}
-
-fn apply_remove_instance(context: &mut PatchApplyContext, tree: &mut RojoTree, removed_id: Ref) {
-    tree.remove(removed_id);
-    context.applied_patch_set.removed.push(removed_id);
 }
 
 fn apply_add_child(
@@ -168,7 +261,7 @@ fn apply_add_child(
         apply_add_child(context, tree, id, child);
     }
 
-    defer_ref_properties(tree, id, context);
+    refresh_reference_metadata(tree, id);
 }
 
 fn apply_update_child(context: &mut PatchApplyContext, tree: &mut RojoTree, patch: PatchUpdate) {
@@ -206,10 +299,6 @@ fn apply_update_child(context: &mut PatchApplyContext, tree: &mut RojoTree, patc
             // instance IDs if they referred to an instance that was created as
             // part of this patch.
             Some(Variant::Ref(referent)) => {
-                if referent.is_none() {
-                    continue;
-                }
-
                 // If our ID is not found in this map, then it either refers to
                 // an existing instance NOT added by this patch, or there was an
                 // error. See `PatchApplyContext::snapshot_id_to_instance_id`
@@ -235,69 +324,50 @@ fn apply_update_child(context: &mut PatchApplyContext, tree: &mut RojoTree, patc
         applied_patch.changed_properties.insert(key, property_entry);
     }
 
-    defer_ref_properties(tree, patch.id, context);
+    refresh_reference_metadata(tree, patch.id);
 
     context.applied_patch_set.updated.push(applied_patch)
 }
 
-/// Calculates manually-specified Ref properties and marks them in the provided
-/// `PatchApplyContext` to be rewritten at the end of the patch application
-/// process.
-///
-/// Currently, this only uses attributes but it can easily handle rewriting
-/// referents in other ways too!
-fn defer_ref_properties(tree: &mut RojoTree, id: Ref, context: &mut PatchApplyContext) {
+/// Register attribute IDs and dependencies before resolving references. A new
+/// target binding can dirty an owner that had no ordinary property update.
+fn refresh_reference_metadata(tree: &mut RojoTree, id: Ref) {
     let instance = tree
         .get_instance(id)
         .expect("Instances should exist when calculating deferred refs");
     let attributes = match instance.properties().get(&ustr("Attributes")) {
         Some(Variant::Attributes(attrs)) => attrs,
-        _ => return,
+        _ => {
+            tree.refresh_attribute_references(id);
+            return;
+        }
     };
 
-    let mut attr_id = None;
-    for (attr_name, attr_value) in attributes.iter() {
-        if attr_name == REF_ID_ATTRIBUTE_NAME {
-            if let Variant::String(specified_id) = attr_value {
-                attr_id = Some(RojoRef::new(specified_id.clone()));
-            } else if let Variant::BinaryString(specified_id) = attr_value {
-                if let Ok(str) = std::str::from_utf8(specified_id.as_ref()) {
-                    attr_id = Some(RojoRef::new(str.to_string()))
-                } else {
-                    log::error!("Specified IDs must be valid UTF-8 strings.")
-                }
-            } else {
-                log::warn!(
-                    "Attribute {attr_name} is of type {:?} when it was \
-                    expected to be a String",
-                    attr_value.ty()
-                )
-            }
-        }
-        if let Some(prop_name) = attr_name.strip_prefix(REF_POINTER_ATTRIBUTE_PREFIX) {
-            if let Variant::String(prop_value) = attr_value {
-                context
-                    .attribute_refs_to_rewrite
-                    .insert(id, (ustr(prop_name), prop_value.clone()));
-            } else if let Variant::BinaryString(prop_value) = attr_value {
-                if let Ok(str) = std::str::from_utf8(prop_value.as_ref()) {
-                    context
-                        .attribute_refs_to_rewrite
-                        .insert(id, (ustr(prop_name), str.to_string()));
-                } else {
-                    log::error!("IDs specified by referent property attributes must be valid UTF-8 strings.")
-                }
-            } else {
-                log::warn!(
-                    "Attribute {attr_name} is of type {:?} when it was \
-                    expected to be a String",
-                    attr_value.ty()
-                )
-            }
-        }
-    }
+    let attr_id = specified_id_from_attributes(attributes);
     if let Some(specified_id) = attr_id {
         tree.set_specified_id(id, specified_id);
+    }
+    tree.refresh_attribute_references(id);
+}
+
+pub(super) fn specified_id_from_attributes(attributes: &Attributes) -> Option<RojoRef> {
+    match attributes.get(REF_ID_ATTRIBUTE_NAME)? {
+        Variant::String(id) => Some(RojoRef::new(id.clone())),
+        Variant::BinaryString(id) => match std::str::from_utf8(id.as_ref()) {
+            Ok(id) => Some(RojoRef::new(id.to_owned())),
+            Err(_) => {
+                log::error!("Specified IDs must be valid UTF-8 strings.");
+                None
+            }
+        },
+        value => {
+            log::warn!(
+                "Attribute {} is of type {:?} when it was expected to be a String",
+                REF_ID_ATTRIBUTE_NAME,
+                value.ty()
+            );
+            None
+        }
     }
 }
 
@@ -310,6 +380,181 @@ mod test {
     use rbx_dom_weak::{types::Variant, UstrMap};
 
     use super::super::PatchAdd;
+
+    fn check_published_primary_part(use_attributes: bool, target_already_declared: bool) {
+        use crate::snapshot::compute_patch_set;
+        use rbx_dom_weak::types::Attributes;
+        let mut owner_attributes = Attributes::new();
+        owner_attributes.insert("Rojo_Target_PrimaryPart".into(), "pole".into());
+        let mut initial = InstanceSnapshot::new().name("Model").class_name("Model");
+        if target_already_declared {
+            initial = initial.property("Attributes", owner_attributes.clone());
+        }
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let root = tree.get_root_id();
+        let initial_patch = compute_patch_set(Some(initial), &tree, root);
+        apply_patch_set(&mut tree, initial_patch);
+        let snapshot_id = Ref::new();
+        let mut child = InstanceSnapshot::new()
+            .name("Pole")
+            .class_name("Part")
+            .snapshot_id(snapshot_id);
+        let mut snapshot = InstanceSnapshot::new().name("Model").class_name("Model");
+        if use_attributes {
+            let mut attributes = Attributes::new();
+            attributes.insert("Rojo_Id".into(), "pole".into());
+            child = child.property("Attributes", attributes);
+            snapshot = snapshot.property("Attributes", owner_attributes);
+        } else {
+            snapshot = snapshot.property("PrimaryPart", Variant::Ref(snapshot_id));
+        }
+        snapshot.children.push(child);
+        let patch = compute_patch_set(Some(snapshot), &tree, root);
+        let published = apply_patch_set(&mut tree, patch);
+        let target = tree.root().children()[0];
+        let expected = Variant::Ref(target);
+        assert_eq!(
+            tree.root().properties().get(&ustr("PrimaryPart")),
+            Some(&expected),
+            "The live tree must resolve the new child"
+        );
+        let update = published
+            .updated
+            .iter()
+            .find(|update| update.id == root)
+            .expect("A newly resolved property must be published");
+        assert_eq!(
+            update.changed_properties.get(&ustr("PrimaryPart")),
+            Some(&Some(expected)),
+            "Live patches must describe the final tree IDs"
+        );
+    }
+
+    #[test]
+    fn primary_part_reference_dependencies_follow_target_lifecycle_across_siblings() {
+        use crate::snapshot::compute_patch_set;
+        use rbx_dom_weak::types::Attributes;
+        fn snapshot(stage: u8) -> InstanceSnapshot {
+            let mut attributes = Attributes::new();
+            attributes.insert("Rojo_Target_Value".into(), "target".into());
+            let owner = InstanceSnapshot::new()
+                .name("Pointer")
+                .class_name("ObjectValue")
+                .property("Attributes", attributes);
+            let target = |name| {
+                let mut attributes = Attributes::new();
+                attributes.insert("Rojo_Id".into(), "target".into());
+                InstanceSnapshot::new()
+                    .name(name)
+                    .class_name("Part")
+                    .property("Attributes", attributes)
+            };
+            let children = match stage {
+                1 => vec![target("Part")],
+                2 => vec![target("Part"), target("Duplicate")],
+                3 => vec![target("Replacement")],
+                _ => vec![],
+            };
+            InstanceSnapshot::new()
+                .name("Root")
+                .class_name("Folder")
+                .children(vec![
+                    owner,
+                    InstanceSnapshot::new()
+                        .name("Targets")
+                        .class_name("Folder")
+                        .children(children),
+                ])
+        }
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let root = tree.get_root_id();
+        let initial = compute_patch_set(Some(snapshot(0)), &tree, root);
+        apply_patch_set(&mut tree, initial);
+        let owner = tree.root().children()[0];
+        let mut previous = None;
+        for stage in [1, 2, 3, 4, 1] {
+            let patch = compute_patch_set(Some(snapshot(stage)), &tree, root);
+            let published = apply_patch_set(&mut tree, patch);
+            let expected = tree
+                .get_specified_id(&RojoRef::new("target".into()))
+                .map(Variant::Ref);
+            let actual = tree
+                .get_instance(owner)
+                .unwrap()
+                .properties()
+                .get(&ustr("Value"))
+                .cloned();
+            assert_eq!(actual, expected, "stage={stage}");
+            if expected != previous {
+                let update = published
+                    .updated
+                    .iter()
+                    .find(|update| update.id == owner)
+                    .expect("A dependency-only change must publish its owner");
+                assert_eq!(
+                    update.changed_properties.get(&ustr("Value")),
+                    Some(&expected),
+                    "stage={stage}"
+                );
+            }
+            previous = expected;
+            let unchanged = compute_patch_set(Some(snapshot(stage)), &tree, root);
+            assert_eq!(unchanged, PatchSet::new(), "stage={stage}");
+        }
+    }
+
+    #[test]
+    fn primary_part_publishes_tree_id_for_new_snapshot_target() {
+        check_published_primary_part(false, false);
+    }
+
+    #[test]
+    fn primary_part_publishes_new_attribute_target() {
+        check_published_primary_part(true, false);
+    }
+
+    #[test]
+    fn primary_part_resolves_predeclared_target_when_child_appears() {
+        check_published_primary_part(true, true);
+    }
+
+    #[test]
+    fn primary_part_can_be_cleared_with_an_explicit_nil_reference() {
+        use crate::snapshot::compute_patch_set;
+        let mut tree = RojoTree::new(
+            InstanceSnapshot::new()
+                .name("Model")
+                .class_name("Model")
+                .children(vec![InstanceSnapshot::new()
+                    .name("Pole")
+                    .class_name("Part")]),
+        );
+        let root = tree.get_root_id();
+        let part = tree.root().children()[0];
+        tree.get_instance_mut(root)
+            .unwrap()
+            .properties_mut()
+            .insert(ustr("PrimaryPart"), Variant::Ref(part));
+        let snapshot = InstanceSnapshot::new()
+            .name("Model")
+            .class_name("Model")
+            .property("PrimaryPart", Variant::Ref(Ref::none()))
+            .children(vec![InstanceSnapshot::new()
+                .name("Pole")
+                .class_name("Part")]);
+        let patch = compute_patch_set(Some(snapshot), &tree, root);
+        let published = apply_patch_set(&mut tree, patch);
+        assert_eq!(
+            tree.root().properties().get(&ustr("PrimaryPart")),
+            Some(&Variant::Ref(Ref::none()))
+        );
+        assert_eq!(
+            published.updated[0]
+                .changed_properties
+                .get(&ustr("PrimaryPart")),
+            Some(&Some(Variant::Ref(Ref::none())))
+        );
+    }
 
     #[test]
     fn add_from_empty() {

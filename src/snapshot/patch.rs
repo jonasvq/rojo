@@ -5,6 +5,7 @@ use rbx_dom_weak::{
     HashMapExt as _, Ustr, UstrMap,
 };
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc};
 
 use super::{InstanceMetadata, InstanceSnapshot};
 
@@ -67,6 +68,22 @@ pub struct AppliedPatchSet {
     pub removed: Vec<Ref>,
     pub added: Vec<Ref>,
     pub updated: Vec<AppliedPatchUpdate>,
+    /// Added instances at commit time. History must not consult a later tree.
+    #[serde(skip)]
+    pub(crate) added_instances: Arc<HashMap<Ref, AppliedPatchInstance>>,
+    /// Resolved authority for affected instances at commit time, not send time.
+    #[serde(skip)]
+    pub(crate) class_authority: Arc<HashMap<Ref, Result<Option<crate::PropertyAuthority>, String>>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AppliedPatchInstance {
+    pub parent: Ref,
+    pub name: String,
+    pub class_name: Ustr,
+    pub properties: UstrMap<Variant>,
+    pub children: Vec<Ref>,
+    pub ignore_unknown_instances: bool,
 }
 
 impl AppliedPatchSet {
@@ -75,6 +92,8 @@ impl AppliedPatchSet {
             removed: Vec::new(),
             added: Vec::new(),
             updated: Vec::new(),
+            added_instances: Arc::default(),
+            class_authority: Arc::default(),
         }
     }
 

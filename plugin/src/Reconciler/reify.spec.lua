@@ -378,4 +378,27 @@ return function()
 		expect(update.id).to.equal("ROOT")
 		expect(update.changedProperties.Value).to.equal(virtualInstances["ROOT"].Properties.Value)
 	end)
+	it("clears a PrimaryPart through a deferred nil reference", function()
+		local model = Instance.new("Model")
+		local part = Instance.new("Part")
+		part.Parent = model
+		model.PrimaryPart = part
+		local instanceMap = InstanceMap.new()
+		instanceMap:insert("MODEL", model)
+		instanceMap:insert("PART", part)
+		local unapplied = PatchSet.newEmpty()
+		applyDeferredRefs(instanceMap, {
+			{
+				id = "MODEL",
+				instance = model,
+				propertyName = "PrimaryPart",
+				virtualValue = { Ref = "00000000000000000000000000000000" },
+			},
+		}, unapplied)
+		local actual = model.PrimaryPart
+		instanceMap:stop()
+		model:Destroy()
+		expect(actual).to.equal(nil)
+		assert(PatchSet.isEmpty(unapplied))
+	end)
 end

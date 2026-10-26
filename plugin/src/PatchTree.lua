@@ -237,7 +237,7 @@ function PatchTree.build(patch, instanceMap, changeListHeaders)
 
 		-- Gather detail text
 		local changeList, changeInfo = nil, nil
-		if next(change.changedProperties) or change.changedName then
+		if next(change.changedProperties) or change.changedName or #(change.removedProperties or {}) > 0 then
 			changeList = {}
 
 			local changeIndex = 0
@@ -261,6 +261,11 @@ function PatchTree.build(patch, instanceMap, changeListHeaders)
 					if currentSuccess then currentValue else "[Error]",
 					if incomingSuccess then incomingValue else select(2, next(incoming))
 				)
+			end
+
+			for _, prop in change.removedProperties or {} do
+				local currentSuccess, currentValue = getProperty(instance, prop)
+				addProp(prop, if currentSuccess then currentValue else "[Error]", "[Reset to default]")
 			end
 
 			changeInfo = {
@@ -446,7 +451,10 @@ function PatchTree.updateMetadata(tree, patch, instanceMap, unappliedPatch)
 			local property = change[1]
 			local propertyFailedToApply = if property == "Name"
 				then failedChange.changedName ~= nil -- Name is not in changedProperties, so it needs a special case
-				else failedChange.changedProperties[property] ~= nil
+				else failedChange.changedProperties[property] ~= nil or table.find(
+					failedChange.removedProperties or {},
+					property
+				) ~= nil
 
 			if not propertyFailedToApply then
 				-- This change didn't fail, no need to mark

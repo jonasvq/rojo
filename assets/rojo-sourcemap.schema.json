@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Rojo local fork sourcemap",
+  "anyOf": [ { "$ref": "#/$defs/node" }, { "type": "null" } ],
+  "$defs": {
+    "node": {
+      "type": "object",
+      "required": ["name", "className"],
+      "properties": {
+        "name": { "type": "string" },
+        "className": { "type": "string" },
+        "filePaths": { "type": "array", "items": { "type": "string" } },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/node" } },
+        "runContext": {
+          "type": "string",
+          "description": "Known reflected RunContext item name; only emitted for Script with --include-run-context."
+        },
+        "runContextValue": {
+          "type": "integer", "minimum": 0, "maximum": 4294967295,
+          "description": "Raw RunContext value, including unknown items; only emitted for Script with --include-run-context."
+        }
+      }
+    }
+  }
+}

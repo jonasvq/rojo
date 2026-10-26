@@ -187,6 +187,10 @@ impl<'sync> SyncbackSnapshot<'sync> {
         self.data.old_tree.inner()
     }
 
+    pub(crate) fn old_rojo_tree(&self) -> &'sync RojoTree {
+        self.data.old_tree
+    }
+
     /// Returns user-specified property ignore rules.
     #[inline]
     pub fn ignore_props(&self) -> Option<&IndexMap<Ustr, Vec<Ustr>>> {

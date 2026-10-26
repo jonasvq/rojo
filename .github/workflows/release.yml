@@ -4,6 +4,9 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: write
+
 jobs:
   create-release:
     name: Create Release
@@ -14,7 +17,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create ${{ github.ref_name }} --draft --verify-tag --title ${{ github.ref_name }}
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "Rojo $GITHUB_REF_NAME (jonasvq fork)" --notes-file "docs/releases/${GITHUB_REF_NAME#v}.md"
 
   build-plugin:
     needs: ["create-release"]
@@ -25,13 +28,11 @@ jobs:
         with:
           submodules: true
 
-      - name: Setup Rokit
-        uses: CompeyDev/setup-rokit@v0.1.2
-        with:
-          version: 'v1.1.0'
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build Plugin
-        run: rojo build plugin.project.json --output Rojo.rbxm
+        run: cargo run --release --locked -- build plugin.project.json --output Rojo.rbxm
 
       - name: Upload Plugin to Release
         env:
@@ -45,13 +46,6 @@ jobs:
           name: Rojo.rbxm
           path: Rojo.rbxm
       
-      - name: Upload Plugin to Roblox
-        env:
-          RBX_API_KEY: ${{ secrets.PLUGIN_UPLOAD_TOKEN }}
-          RBX_UNIVERSE_ID: ${{ vars.PLUGIN_CI_PLACE_ID }}
-          RBX_PLACE_ID: ${{ vars.PLUGIN_CI_UNIVERSE_ID }}
-        run: lune run upload-plugin Rojo.rbxm
-
   build:
     needs: ["create-release"]
     strategy:
@@ -155,3 +149,22 @@ jobs:
         with:
           path: ${{ env.ARTIFACT_NAME }}
           name: ${{ env.ARTIFACT_NAME }}
+
+  publish:
+    name: Publish Fork Release
+    needs: ["build", "build-plugin"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bundle Guides and Example
+        run: |
+          zip -r "rojo-${GITHUB_REF_NAME#v}-guides.zip" docs/coding-agent-guide.md docs/fully-managed-workflow.md docs/rojo-cookbook.md docs/windows-local-install.md docs/model-scale.md docs/class-authority.md "docs/releases/${GITHUB_REF_NAME#v}.md" examples/agent-workflow
+      - name: Publish GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" "rojo-${GITHUB_REF_NAME#v}-guides.zip"
+          gh release download "$GITHUB_REF_NAME" --dir release-assets
+          (cd release-assets && sha256sum *) > SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest

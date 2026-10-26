@@ -116,6 +116,12 @@ impl InMemoryFsInner {
 
     fn remove(&mut self, root_path: PathBuf) {
         self.orphans.remove(&root_path);
+        if let Some(Entry::Dir { children }) = root_path
+            .parent()
+            .and_then(|parent| self.entries.get_mut(parent))
+        {
+            children.remove(&root_path);
+        }
 
         let mut to_remove = VecDeque::new();
         to_remove.push_back(root_path);
@@ -188,12 +194,20 @@ impl VfsBackend for InMemoryFs {
 
     fn create_dir_all(&mut self, path: &Path) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let mut path_buf = path.to_path_buf();
-        while let Some(parent) = path_buf.parent() {
-            inner.load_snapshot(parent.to_path_buf(), VfsSnapshot::empty_dir())?;
-            path_buf.pop();
+        let mut missing = Vec::new();
+        for ancestor in path.ancestors() {
+            match inner.entries.get(ancestor) {
+                Some(Entry::Dir { .. }) => break,
+                Some(Entry::File { .. }) => return must_be_dir(ancestor),
+                None => missing.push(ancestor),
+            }
         }
-        inner.load_snapshot(path.to_path_buf(), VfsSnapshot::empty_dir())
+        // Loading an empty snapshot replaces a directory's child list. Only
+        // create missing directories, from the existing ancestor downwards.
+        for path in missing.into_iter().rev() {
+            inner.load_snapshot(path.to_path_buf(), VfsSnapshot::empty_dir())?;
+        }
+        Ok(())
     }
 
     fn remove_file(&mut self, path: &Path) -> io::Result<()> {

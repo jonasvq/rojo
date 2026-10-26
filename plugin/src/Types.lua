@@ -26,6 +26,7 @@ local ApiInstanceUpdate = t.interface({
 	changedName = t.optional(t.string),
 	changedClassName = t.optional(t.string),
 	changedProperties = t.map(t.string, ApiValue),
+	removedProperties = t.optional(t.array(t.string)),
 	changedMetadata = t.optional(ApiInstanceMetadata),
 })
 
@@ -33,13 +34,21 @@ local ApiSubscribeMessage = t.interface({
 	removed = t.array(RbxId),
 	added = t.map(RbxId, ApiInstance),
 	updated = t.array(ApiInstanceUpdate),
+	classAuthority = t.optional(
+		t.map(RbxId, t.union(t.literal("legacy"), t.literal("filesystem"), t.literal("studio")))
+	),
 })
 
 local ApiInfoResponse = t.interface({
+	capabilities = t.optional(t.array(t.string)),
 	sessionId = t.string,
 	serverVersion = t.string,
 	protocolVersion = t.number,
 	expectedPlaceIds = t.optional(t.array(t.number)),
+	unexpectedPlaceIds = t.optional(t.array(t.number)),
+	placeId = t.optional(t.number),
+	gameId = t.optional(t.number),
+	projectName = t.optional(t.string),
 	rootInstanceId = RbxId,
 })
 
@@ -47,6 +56,9 @@ local ApiReadResponse = t.interface({
 	sessionId = t.string,
 	messageCursor = t.number,
 	instances = t.map(RbxId, ApiInstance),
+	classAuthority = t.optional(
+		t.map(RbxId, t.union(t.literal("legacy"), t.literal("filesystem"), t.literal("studio")))
+	),
 })
 
 local SocketPacketType = t.union(t.literal("messages"))

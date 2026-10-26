@@ -20,6 +20,7 @@ return function(instanceMap, propertyChanges)
 
 		if instanceId == nil then
 			Log.warn("Ignoring change for instance {:?} as it is unknown to Rojo", instance)
+			propertyChanges[instance] = nil
 			continue
 		end
 
@@ -30,7 +31,7 @@ return function(instanceMap, propertyChanges)
 				Log.warn("Cannot sync non-nil Parent property changes yet")
 			end
 		else
-			local update = encodePatchUpdate(instance, instanceId, properties)
+			local update = encodePatchUpdate(instance, instanceId, properties, instanceMap)
 			table.insert(patch.updated, update)
 		end
 

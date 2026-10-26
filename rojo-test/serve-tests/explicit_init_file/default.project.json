@@ -1,0 +1,7 @@
+{
+  "name": "Root",
+  "tree": {
+    "$className": "Folder",
+    "Selected": { "$path": "src/init.luau" }
+  }
+}

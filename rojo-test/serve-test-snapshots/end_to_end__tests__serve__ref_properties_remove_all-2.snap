@@ -1,5 +1,6 @@
 ---
 source: tests/tests/serve.rs
+assertion_line: 567
 expression: "read_response.intern_and_redact(&mut redactions, root_id)"
 ---
 instances:
@@ -26,8 +27,5 @@ instances:
         Attributes:
           Rojo_Target_Value:
             String: test pointer
-      Value:
-        Ref: id-4
 messageCursor: 1
 sessionId: id-1
-

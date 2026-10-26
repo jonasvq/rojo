@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{format_err, Context};
+use anyhow::{ensure, Context};
 use indexmap::IndexMap;
 use memofs::{IoResultExt as _, Vfs};
 use rbx_dom_weak::{
@@ -14,6 +14,56 @@ use crate::{
     RojoRef,
 };
 
+fn apply_native_script_class(
+    snapshot: &mut InstanceSnapshot,
+    class: Option<Ustr>,
+    properties: &IndexMap<Ustr, UnresolvedValue>,
+    path: &Path,
+) -> anyhow::Result<()> {
+    if let Some(class) = class {
+        ensure!(
+            matches!(snapshot.class_name.as_str(), "Script" | "LocalScript")
+                && matches!(class.as_str(), "Script" | "LocalScript")
+                && snapshot.properties.contains_key(&"Source".into()),
+            "className in {} only supports native Script/LocalScript overrides ({} -> {})",
+            path.display(),
+            snapshot.class_name,
+            class
+        );
+        snapshot.class_name = class;
+    }
+    if snapshot.class_name == "LocalScript" {
+        ensure!(
+            !properties.contains_key(&Ustr::from("RunContext")),
+            "LocalScript metadata cannot specify RunContext: {}",
+            path.display()
+        );
+        snapshot.properties.remove(&"RunContext".into());
+    }
+    Ok(())
+}
+
+fn parse_metadata<T: serde::de::DeserializeOwned>(slice: &[u8], path: &Path) -> anyhow::Result<T> {
+    let context = || {
+        format!(
+            "File contained malformed .meta.json data: {}",
+            path.display()
+        )
+    };
+    let value: serde_json::Value = json::from_slice_with_context(slice, context)?;
+    let fields = [
+        "$schema",
+        "id",
+        "ignoreUnknownInstances",
+        "properties",
+        "attributes",
+        "className",
+        "ruleDefaults",
+    ];
+    json::warn_unknown_fields(&value, &fields, path, "$");
+    serde_json::from_value(value).with_context(|| format!("{}: Invalid JSON structure", context()))
+}
+
 /// Represents metadata in a sibling file with the same basename.
 ///
 /// As an example, hello.meta.json next to hello.lua would allow assigning
@@ -21,6 +71,13 @@ use crate::{
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdjacentMetadata {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::project::RuleDefaultMask::is_empty"
+    )]
+    pub rule_defaults: crate::project::RuleDefaultMask,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<Ustr>,
     #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
     schema: Option<String>,
 
@@ -55,13 +112,20 @@ impl AdjacentMetadata {
         let meta_path_json = path.with_file_name(format!("{name}.meta.json"));
         let meta_path_jsonc = path.with_file_name(format!("{name}.meta.jsonc"));
 
+        super::rule_defaults::prepare_class(
+            snapshot,
+            vfs,
+            path,
+            &[meta_path_json.clone(), meta_path_jsonc.clone()],
+        )?;
+
         if let Some(meta_contents) = vfs.read(&meta_path_json).with_not_found()? {
             let mut metadata = Self::from_slice(&meta_contents, meta_path_json.clone())?;
             metadata.apply_all(snapshot)?;
         }
 
         if let Some(meta_contents) = vfs.read(&meta_path_jsonc).with_not_found()? {
-            let mut metadata = Self::from_slice(&meta_contents, meta_path_json.clone())?;
+            let mut metadata = Self::from_slice(&meta_contents, meta_path_jsonc.clone())?;
             metadata.apply_all(snapshot)?;
         }
 
@@ -73,12 +137,7 @@ impl AdjacentMetadata {
     }
 
     fn from_slice(slice: &[u8], path: PathBuf) -> anyhow::Result<Self> {
-        let mut meta: Self = json::from_slice_with_context(slice, || {
-            format!(
-                "File contained malformed .meta.json data: {}",
-                path.display()
-            )
-        })?;
+        let mut meta: Self = parse_metadata(slice, &path)?;
 
         meta.path = path;
         Ok(meta)
@@ -144,12 +203,25 @@ impl AdjacentMetadata {
             }
         }
 
+        // Hash-map traversal must not turn identical syncback input into
+        // order-only diffs. Keep the public IndexMap representation unchanged.
+        properties.sort_by(|a, _, b, _| a.as_str().cmp(b.as_str()));
+        attributes.sort_keys();
+
+        let mut rule_defaults = Default::default();
+        let mut ignore_unknown_instances = ignore_unknown_instances.then_some(true);
+        super::rule_defaults::rewrite_metadata(
+            snapshot,
+            &mut properties,
+            &mut attributes,
+            &mut rule_defaults,
+            &mut ignore_unknown_instances,
+        )?;
+
         Ok(Some(Self {
-            ignore_unknown_instances: if ignore_unknown_instances {
-                Some(true)
-            } else {
-                None
-            },
+            rule_defaults,
+            class_name: None,
+            ignore_unknown_instances,
             properties,
             attributes,
             path,
@@ -215,6 +287,12 @@ impl AdjacentMetadata {
 
     pub fn apply_all(&mut self, snapshot: &mut InstanceSnapshot) -> anyhow::Result<()> {
         self.apply_ignore_unknown_instances(snapshot);
+        apply_native_script_class(
+            snapshot,
+            self.class_name.take(),
+            &self.properties,
+            &self.path,
+        )?;
         self.apply_properties(snapshot)?;
         self.apply_id(snapshot)?;
         self.apply_schema(snapshot)?;
@@ -229,6 +307,8 @@ impl AdjacentMetadata {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.attributes.is_empty()
+            && self.rule_defaults.is_empty()
+            && self.class_name.is_none()
             && self.properties.is_empty()
             && self.ignore_unknown_instances.is_none()
     }
@@ -244,6 +324,11 @@ impl AdjacentMetadata {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectoryMetadata {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::project::RuleDefaultMask::is_empty"
+    )]
+    pub rule_defaults: crate::project::RuleDefaultMask,
     #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
     schema: Option<String>,
 
@@ -280,6 +365,14 @@ impl DirectoryMetadata {
         let meta_path_json = path.join("init.meta.json");
         let meta_path_jsonc = path.join("init.meta.jsonc");
 
+        let (_, _, source_path) = super::get_dir_middleware(vfs, path)?;
+        super::rule_defaults::prepare_class(
+            snapshot,
+            vfs,
+            &source_path,
+            &[meta_path_json.clone(), meta_path_jsonc.clone()],
+        )?;
+
         if let Some(meta_contents) = vfs.read(&meta_path_json).with_not_found()? {
             let mut metadata = Self::from_slice(&meta_contents, meta_path_json.clone())?;
             metadata.apply_all(snapshot)?;
@@ -298,12 +391,7 @@ impl DirectoryMetadata {
     }
 
     fn from_slice(slice: &[u8], path: PathBuf) -> anyhow::Result<Self> {
-        let mut meta: Self = json::from_slice_with_context(slice, || {
-            format!(
-                "File contained malformed init.meta.json data: {}",
-                path.display()
-            )
-        })?;
+        let mut meta: Self = parse_metadata(slice, &path)?;
 
         meta.path = path;
         Ok(meta)
@@ -372,12 +460,24 @@ impl DirectoryMetadata {
             }
         }
 
+        // Hash-map traversal must not turn identical syncback input into
+        // order-only diffs. Keep the public IndexMap representation unchanged.
+        properties.sort_by(|a, _, b, _| a.as_str().cmp(b.as_str()));
+        attributes.sort_keys();
+
+        let mut rule_defaults = Default::default();
+        let mut ignore_unknown_instances = ignore_unknown_instances.then_some(true);
+        super::rule_defaults::rewrite_metadata(
+            snapshot,
+            &mut properties,
+            &mut attributes,
+            &mut rule_defaults,
+            &mut ignore_unknown_instances,
+        )?;
+
         Ok(Some(Self {
-            ignore_unknown_instances: if ignore_unknown_instances {
-                Some(true)
-            } else {
-                None
-            },
+            rule_defaults,
+            ignore_unknown_instances,
             properties,
             attributes,
             class_name: None,
@@ -398,19 +498,18 @@ impl DirectoryMetadata {
     }
 
     fn apply_class_name(&mut self, snapshot: &mut InstanceSnapshot) -> anyhow::Result<()> {
-        if let Some(class_name) = self.class_name.take() {
-            if snapshot.class_name != "Folder" {
-                // TODO: Turn into error type
-                return Err(format_err!(
-                    "className in init.meta.json can only be specified if the \
-                     affected directory would turn into a Folder instance."
-                ));
+        if snapshot.class_name == "Folder" {
+            if let Some(class_name) = self.class_name.take() {
+                snapshot.class_name = class_name;
             }
-
-            snapshot.class_name = class_name;
+            return Ok(());
         }
-
-        Ok(())
+        apply_native_script_class(
+            snapshot,
+            self.class_name.take(),
+            &self.properties,
+            &self.path,
+        )
     }
 
     fn apply_ignore_unknown_instances(&mut self, snapshot: &mut InstanceSnapshot) {
@@ -469,17 +568,14 @@ impl DirectoryMetadata {
     ///
     /// - The number of properties and attributes is 0
     /// - `ignore_unknown_instances` is None
-    /// - `class_name` is either None or not Some("Folder")
+    /// - `class_name` is None (explicit Folder can override a class rule)
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.attributes.is_empty()
+            && self.rule_defaults.is_empty()
             && self.properties.is_empty()
             && self.ignore_unknown_instances.is_none()
-            && if let Some(class) = &self.class_name {
-                class == "Folder"
-            } else {
-                true
-            }
+            && self.class_name.is_none()
     }
 }
 

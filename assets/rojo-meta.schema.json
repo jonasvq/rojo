@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Rojo local fork filesystem metadata",
+  "type": "object",
+  "properties": {
+    "$schema": {"type":"string"},
+    "id": {"type":["string","null"]},
+    "className": {
+      "type":["string","null"],
+      "description":"For native Lua sources, explicitly select Script or LocalScript; ModuleScript/unrelated conversions are rejected. LocalScript metadata cannot contain RunContext. Plain Folder directory metadata retains its existing arbitrary-class behavior."
+    },
+    "ignoreUnknownInstances": {"type":["boolean","null"]},
+    "properties": {"type":"object"},
+    "attributes": {"type":"object"},
+    "ruleDefaults": {"$ref":"rojo-project.schema.json#/$defs/ruleDefaultMask"}
+  },
+  "additionalProperties": false
+}

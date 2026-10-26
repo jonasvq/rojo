@@ -23,7 +23,7 @@ pub fn snapshot_rbxm(
 
     if children.len() == 1 {
         let child = children[0];
-        let snapshot = InstanceSnapshot::from_tree(temp_tree, child)
+        let mut snapshot = InstanceSnapshot::from_tree(temp_tree, child)
             .name(name)
             .metadata(
                 InstanceMetadata::new()
@@ -32,6 +32,7 @@ pub fn snapshot_rbxm(
                     .context(context),
             );
 
+        snapshot.inherit_model_context(context);
         Ok(Some(snapshot))
     } else {
         anyhow::bail!(
@@ -50,11 +51,19 @@ pub fn syncback_rbxm<'sync>(
     // Long-term, we probably want to have some logic for if this contains a
     // script. That's a future endeavor though.
     let mut serialized = Vec::new();
-    rbx_binary::to_writer(&mut serialized, snapshot.new_tree(), &[inst.referent()])
-        .context("failed to serialize new rbxm")?;
+    let projection = super::rule_defaults::model_projection(snapshot)?;
+    crate::binary_serialization::to_writer(
+        &mut serialized,
+        projection.as_ref().unwrap_or(snapshot.new_tree()),
+        &[inst.referent()],
+    )
+    .context("failed to serialize new rbxm")?;
+    super::rule_defaults::validate_binary_projection(snapshot, &serialized)?;
+    let mut fs_snapshot = FsSnapshot::new().with_added_file(&snapshot.path, serialized);
+    super::rule_defaults::write_model_mask(snapshot, &mut fs_snapshot)?;
 
     Ok(SyncbackReturn {
-        fs_snapshot: FsSnapshot::new().with_added_file(&snapshot.path, serialized),
+        fs_snapshot,
         children: Vec::new(),
         removed_children: Vec::new(),
     })

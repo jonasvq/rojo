@@ -1,6 +1,6 @@
 [package]
 name = "rojo"
-version = "7.7.1"
+version = "8.0.0"
 rust-version = "1.88"
 authors = [
     "Lucien Greathouse <me@lpghatguy.com>",
@@ -11,7 +11,7 @@ description = "Enables professional-grade development tools for Roblox developer
 license = "MPL-2.0"
 homepage = "https://rojo.space"
 documentation = "https://rojo.space/docs"
-repository = "https://github.com/rojo-rbx/rojo"
+repository = "https://github.com/jonasvq/rojo"
 readme = "README.md"
 edition = "2021"
 build = "build.rs"
@@ -25,10 +25,16 @@ panic = "abort"
 panic = "abort"
 
 [features]
-default = []
+default = ["cli"]
+cli = [
+    "dep:backtrace", "dep:bincode", "dep:clap", "dep:env_logger",
+    "dep:futures", "dep:humantime", "dep:hyper", "dep:hyper-tungstenite",
+    "dep:jod-thread", "dep:num_cpus", "dep:opener", "dep:rayon",
+    "dep:reqwest", "dep:ritz", "dep:roblox_install", "dep:termcolor", "dep:tokio",
+]
 
 # Enable this feature to live-reload assets from the web UI.
-dev_live_assets = []
+dev_live_assets = ["cli"]
 
 # Run Rojo with this feature to open a Tracy session.
 # Currently uses protocol v63, last supported in Tracy 0.9.1.
@@ -36,17 +42,72 @@ profile-with-tracy = ["profiling/profile-with-tracy"]
 
 [workspace]
 members = ["crates/*"]
+exclude = ["vendor/rbx_types", "vendor/rbx_dom_weak"]
+
+[patch.crates-io]
+rbx_types = { path = "vendor/rbx_types" }
+rbx_dom_weak = { path = "vendor/rbx_dom_weak" }
 
 [lib]
 name = "librojo"
 path = "src/lib.rs"
 
+[[bin]]
+name = "rojo"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [[bench]]
 name = "build"
 harness = false
+required-features = ["cli"]
+
+[[test]]
+name = "build_compression"
+required-features = ["cli"]
+[[test]]
+name = "debugger_plans"
+required-features = ["cli"]
+[[test]]
+name = "empty_directories"
+required-features = ["cli"]
+[[test]]
+name = "end_to_end"
+required-features = ["cli"]
+[[test]]
+name = "init_project"
+required-features = ["cli"]
+[[test]]
+name = "open_workflow"
+required-features = ["cli"]
+[[test]]
+name = "place_update"
+required-features = ["cli"]
+[[test]]
+name = "project_stems"
+required-features = ["cli"]
+[[test]]
+name = "project_versions"
+required-features = ["cli"]
+[[test]]
+name = "stdin_project"
+required-features = ["cli"]
+[[test]]
+name = "studio_output"
+required-features = ["cli"]
+[[test]]
+name = "syncback_watch"
+required-features = ["cli"]
+[[test]]
+name = "text_modules"
+required-features = ["cli"]
+[[test]]
+name = "write_receipts"
+required-features = ["cli"]
 
 [dependencies]
 memofs = { version = "0.4.0", path = "crates/memofs" }
+rojo-project-types = { version = "0.1.0", path = "crates/rojo-project-types" }
 
 # These dependencies can be uncommented when working on rbx-dom simultaneously
 # rbx_binary = { path = "../rbx-dom/rbx_binary", features = [
@@ -64,40 +125,40 @@ rbx_reflection_database = "3.0.1"
 rbx_xml = "3.0.1"
 
 anyhow = "1.0.80"
-backtrace = "0.3.69"
-bincode = "1.3.3"
+backtrace = { version = "0.3.69", optional = true }
+bincode = { version = "1.3.3", optional = true }
 crossbeam-channel = "0.5.12"
 csv = "1.3.0"
 dunce = "1.0.5"
-env_logger = "0.9.3"
+env_logger = { version = "0.9.3", optional = true }
 fs-err = "2.11.0"
-futures = "0.3.30"
+futures = { version = "0.3.30", optional = true }
 globset = "0.4.14"
-humantime = "2.1.0"
-hyper = { version = "0.14.28", features = ["server", "tcp", "http1"] }
-hyper-tungstenite = "0.11.0"
-jod-thread = "0.1.2"
+humantime = { version = "2.1.0", optional = true }
+hyper = { version = "0.14.28", features = ["server", "tcp", "http1"], optional = true }
+hyper-tungstenite = { version = "0.11.0", optional = true }
+jod-thread = { version = "0.1.2", optional = true }
 log = "0.4.21"
-num_cpus = "1.16.0"
-opener = "0.5.2"
-rayon = "1.9.0"
-reqwest = { version = "0.11.24", default-features = false, features = [
+num_cpus = { version = "1.16.0", optional = true }
+opener = { version = "0.5.2", optional = true }
+rayon = { version = "1.9.0", optional = true }
+reqwest = { version = "0.11.24", optional = true, default-features = false, features = [
     "blocking",
     "json",
     "rustls-tls",
 ] }
-ritz = "0.1.0"
-roblox_install = "1.0.0"
+ritz = { version = "0.1.0", optional = true }
+roblox_install = { version = "1.0.0", optional = true }
 serde = { version = "1.0.197", features = ["derive", "rc"] }
 serde_json = "1.0.145"
 jsonc-parser = { version = "0.27.0", features = ["serde"] }
 strum = { version = "0.27", features = ["derive"] }
 toml = "0.5.11"
-termcolor = "1.4.1"
+termcolor = { version = "1.4.1", optional = true }
 thiserror = "1.0.57"
-tokio = { version = "1.36.0", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.36.0", features = ["rt", "rt-multi-thread", "macros"], optional = true }
 uuid = { version = "1.7.0", features = ["v4", "serde"] }
-clap = { version = "3.2.25", features = ["derive"] }
+clap = { version = "3.2.25", features = ["derive"], optional = true }
 profiling = "1.0.15"
 yaml-rust2 = "0.10.3"
 data-encoding = "2.8.0"
@@ -108,9 +169,6 @@ float-cmp = "0.9.0"
 indexmap = { version = "2.10.0", features = ["serde"] }
 rmp-serde = "1.3.0"
 serde_bytes = "0.11.19"
-
-[target.'cfg(windows)'.dependencies]
-winreg = "0.10.1"
 
 [build-dependencies]
 memofs = { version = "0.4.0", path = "crates/memofs" }
@@ -123,6 +181,7 @@ maplit = "1.0.2"
 semver = "1.0.22"
 
 [dev-dependencies]
+env_logger = "0.9.3"
 rojo-insta-ext = { path = "crates/rojo-insta-ext" }
 
 criterion = "0.3.6"

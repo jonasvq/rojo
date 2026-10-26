@@ -37,6 +37,8 @@ fn place_setup<P: AsRef<Path>>(input_path: P) -> (TempDir, BuildCommand) {
         project: input,
         watch: false,
         plugin: None,
+        input: None,
+        compress: None,
         output,
     };
 

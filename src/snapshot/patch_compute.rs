@@ -1,7 +1,10 @@
 //! Defines the algorithm for computing a roughly-minimal patch set given an
 //! existing instance tree and an instance snapshot.
 
-use std::{collections::HashMap, mem::take};
+use std::{
+    collections::{HashMap, VecDeque},
+    mem::take,
+};
 
 use rbx_dom_weak::{
     types::{Ref, Variant},
@@ -38,6 +41,8 @@ pub fn compute_patch_set(snapshot: Option<InstanceSnapshot>, tree: &RojoTree, id
 #[derive(Default)]
 struct ComputePatchContext {
     snapshot_id_to_instance_id: HashMap<Ref, Ref>,
+    #[cfg(test)]
+    child_candidates_examined: usize,
 }
 
 fn rewrite_refs_in_updates(context: &ComputePatchContext, updates: &mut [PatchUpdate]) {
@@ -99,6 +104,13 @@ fn compute_property_patches(
     patch_set: &mut PatchSet,
     tree: &RojoTree,
 ) {
+    if let Some(Variant::Attributes(attributes)) = snapshot.properties.get(&ustr("Attributes")) {
+        if let Some(id) = super::patch_apply::specified_id_from_attributes(attributes) {
+            // Patch application derives this metadata from Rojo_Id too. Compare
+            // the effective ID rather than repeatedly clearing and restoring it.
+            snapshot.metadata.specified_id = Some(id);
+        }
+    }
     let mut visited_properties = UstrSet::default();
     let mut changed_properties = UstrMap::new();
 
@@ -223,37 +235,80 @@ fn compute_children_patches(
 
     let mut paired_instances = vec![false; instance_children.len()];
 
+    // Keep sibling order within each name/class group, without rescanning the
+    // already paired prefix for every child in a large model.
+    let mut candidates_by_name_class: HashMap<_, HashMap<_, VecDeque<usize>>> = HashMap::new();
+    for (index, child_id) in instance_children.iter().enumerate() {
+        let child = tree
+            .inner()
+            .get_by_ref(*child_id)
+            .expect("Instance did not exist in tree");
+        candidates_by_name_class
+            .entry(child.name.as_str())
+            .or_default()
+            .entry(child.class)
+            .or_default()
+            .push_back(index);
+    }
+
     for snapshot_child in take(&mut snapshot.children) {
-        let matching_instance =
-            instance_children
-                .iter()
-                .enumerate()
-                .find(|(instance_index, instance_child_id)| {
-                    if paired_instances[*instance_index] {
-                        return false;
-                    }
-
-                    let instance_child = tree
-                        .get_instance(**instance_child_id)
-                        .expect("Instance did not exist in tree");
-
-                    if snapshot_child.name == instance_child.name()
-                        && snapshot_child.class_name == instance_child.class_name()
+        let matching_index = candidates_by_name_class
+            .get_mut(snapshot_child.name.as_ref())
+            .and_then(|by_class| by_class.get_mut(&snapshot_child.class_name))
+            .and_then(|candidates| {
+                while let Some(index) = candidates.pop_front() {
+                    #[cfg(test)]
                     {
-                        paired_instances[*instance_index] = true;
-                        return true;
+                        context.child_candidates_examined += 1;
                     }
-
-                    false
+                    if !paired_instances[index] {
+                        return Some(index);
+                    }
+                }
+                None
+            })
+            .or_else(|| {
+                // Global emitLegacyScripts changes re-snapshot ancestors.
+                // Keep the identity of the same script source so clients
+                // receive a class update and can preserve unmanaged children.
+                let source = snapshot_child.metadata.instigating_source.as_ref()?;
+                let other_class = match snapshot_child.class_name.as_str() {
+                    "Script" => ustr("LocalScript"),
+                    "LocalScript" => ustr("Script"),
+                    _ => return None,
+                };
+                let bucket = candidates_by_name_class
+                    .get(snapshot_child.name.as_ref())?
+                    .get(&other_class)?;
+                let mut candidates = bucket.iter().copied().filter(|index| {
+                    #[cfg(test)]
+                    {
+                        context.child_candidates_examined += 1;
+                    }
+                    !paired_instances[*index]
+                        && tree
+                            .get_instance(instance_children[*index])
+                            .expect("Instance did not exist in tree")
+                            .metadata()
+                            .instigating_source
+                            .as_ref()
+                            == Some(source)
                 });
+                let candidate = candidates.next()?;
+                if candidates.next().is_some() {
+                    return None;
+                }
+                Some(candidate)
+            });
 
-        match matching_instance {
-            Some((_, instance_child_id)) => {
+        match matching_index {
+            Some(index) => {
+                paired_instances[index] = true;
                 compute_patch_set_internal(
                     context,
                     snapshot_child,
                     tree,
-                    *instance_child_id,
+                    instance_children[index],
                     patch_set,
                 );
             }
@@ -326,6 +381,163 @@ mod test {
     use super::*;
 
     use std::borrow::Cow;
+
+    #[test]
+    fn wide_sibling_matching_examines_a_linear_number_of_candidates() {
+        let count = 1024;
+        let snapshot = || {
+            InstanceSnapshot::new().children(
+                (0..count)
+                    .map(|index| InstanceSnapshot::new().name(format!("Child{index}")))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let tree = RojoTree::new(snapshot());
+        let mut context = ComputePatchContext::default();
+        let mut patch = PatchSet::new();
+        compute_patch_set_internal(
+            &mut context,
+            snapshot(),
+            &tree,
+            tree.get_root_id(),
+            &mut patch,
+        );
+        assert!(patch.added_instances.is_empty());
+        assert!(patch.removed_instances.is_empty());
+        assert!(patch.updated_instances.is_empty());
+        assert!(
+            context.child_candidates_examined <= count * 2,
+            "matching {count} unchanged siblings examined {} candidates",
+            context.child_candidates_examined
+        );
+    }
+
+    #[test]
+    fn duplicate_siblings_keep_first_unpaired_name_and_class_matching() {
+        let child = |class, value: &str| {
+            InstanceSnapshot::new()
+                .name("Duplicate")
+                .class_name(class)
+                .properties(UstrMap::from_iter([(ustr("Value"), value.into())]))
+        };
+        let tree = RojoTree::new(InstanceSnapshot::new().children(vec![
+            child("StringValue", "first"),
+            child("IntValue", "other class"),
+            child("StringValue", "second"),
+            child("StringValue", "removed"),
+        ]));
+        let ids = tree.root().children().to_vec();
+        let patch = compute_patch_set(
+            Some(InstanceSnapshot::new().children(vec![
+                child("IntValue", "changed other class"),
+                child("StringValue", "changed first"),
+                child("StringValue", "changed second"),
+            ])),
+            &tree,
+            tree.get_root_id(),
+        );
+        assert!(patch.added_instances.is_empty());
+        assert_eq!(patch.removed_instances, vec![ids[3]]);
+        let matched: Vec<_> = patch
+            .updated_instances
+            .iter()
+            .map(|update| update.id)
+            .collect();
+        assert_eq!(matched, vec![ids[1], ids[0], ids[2]]);
+    }
+
+    #[test]
+    fn script_class_fallback_does_not_reuse_unrelated_or_ambiguous_sources() {
+        use super::super::InstanceMetadata;
+        let child = |class, source: &str| {
+            InstanceSnapshot::new()
+                .name("Client")
+                .class_name(class)
+                .metadata(InstanceMetadata::new().instigating_source(std::path::Path::new(source)))
+        };
+        for children in [
+            vec![child("LocalScript", "/other")],
+            vec![child("LocalScript", "/same"), child("LocalScript", "/same")],
+        ] {
+            let count = children.len();
+            let tree = RojoTree::new(InstanceSnapshot::new().children(children));
+            let snapshot = InstanceSnapshot::new().children(vec![child("Script", "/same")]);
+            let patch = compute_patch_set(Some(snapshot), &tree, tree.get_root_id());
+            assert_eq!(patch.removed_instances.len(), count);
+            assert_eq!(patch.added_instances.len(), 1);
+        }
+    }
+
+    #[test]
+    fn toggling_legacy_scripts_preserves_child_id_in_full_project_snapshot() {
+        use crate::snapshot::{apply_patch_set, InstanceContext};
+        use crate::snapshot_middleware::snapshot_from_vfs;
+        use memofs::{InMemoryFs, Vfs, VfsSnapshot};
+        let mut fs = InMemoryFs::new();
+        let project = |legacy| {
+            format!(r#"{{"name":"Root","emitLegacyScripts":{legacy},"tree":{{"$path":"src"}}}}"#)
+        };
+        fs.load_snapshot(
+            "/project",
+            VfsSnapshot::dir([
+                ("default.project.json", VfsSnapshot::file(project(true))),
+                (
+                    "src",
+                    VfsSnapshot::dir([(
+                        "Client",
+                        VfsSnapshot::dir([
+                            ("init.client.lua", VfsSnapshot::file("print('client')")),
+                            (
+                                "init.meta.json",
+                                VfsSnapshot::file(r#"{"ignoreUnknownInstances":true}"#),
+                            ),
+                        ]),
+                    )]),
+                ),
+            ]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(fs);
+        let path = std::path::Path::new("/project/default.project.json");
+        let initial = snapshot_from_vfs(&InstanceContext::default(), &vfs, path)
+            .unwrap()
+            .unwrap();
+        let mut tree = RojoTree::new(initial);
+        let root = tree.get_root_id();
+        let client = tree.root().children()[0];
+        assert_eq!(
+            tree.get_instance(client).unwrap().class_name(),
+            "LocalScript"
+        );
+        for legacy in [false, true] {
+            vfs.write(path, project(legacy)).unwrap();
+            let snapshot = snapshot_from_vfs(&InstanceContext::default(), &vfs, path)
+                .unwrap()
+                .unwrap();
+            let patch = compute_patch_set(Some(snapshot), &tree, root);
+            assert!(
+                patch.removed_instances.is_empty(),
+                "A class toggle must not remove the managed identity"
+            );
+            assert!(
+                patch.added_instances.is_empty(),
+                "A class toggle must be an update"
+            );
+            assert!(patch
+                .updated_instances
+                .iter()
+                .any(|update| update.id == client
+                    && update.changed_class_name.as_deref()
+                        == Some(if legacy { "LocalScript" } else { "Script" })));
+            apply_patch_set(&mut tree, patch);
+            assert!(
+                tree.get_instance(client)
+                    .unwrap()
+                    .metadata()
+                    .ignore_unknown_instances
+            );
+        }
+    }
 
     /// This test makes sure that rewriting refs in instance update patches to
     /// instances that already exists works. We should be able to correlate the

@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Rojo local fork project",
+  "type": "object",
+  "required": ["tree"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "$version": { "type": "integer", "enum": [1, 2], "description": "Omitted or V1 retains legacy defaults. Explicit V2 defaults to modern Script/RunContext emission and inherited unknown-descendant preservation; explicit settings win. No automatic source migration." },
+    "name": { "type": ["string", "null"] },
+    "tree": { "$ref": "#/$defs/node" },
+    "servePort": { "type": ["integer", "null"], "minimum": 0, "maximum": 65535 },
+    "servePlaceIds": { "anyOf": [{ "$ref": "#/$defs/ids" }, { "type": "null" }] },
+    "blockedPlaceIds": { "anyOf": [{ "$ref": "#/$defs/ids" }, { "type": "null" }] },
+    "placeId": { "type": ["integer", "null"], "minimum": 0 },
+    "gameId": { "type": ["integer", "null"], "minimum": 0 },
+    "serveAddress": { "type": ["string", "null"] },
+    "serveAllowedHosts": { "$ref": "#/$defs/strings" },
+    "emitLegacyScripts": { "type": ["boolean", "null"] },
+    "ignoreEmptyDirectories": { "type": ["boolean", "null"], "description": "Omit implicit physically empty directory trees. Nested projects inherit omission; explicit false restores empty Folders. Files including .gitkeep and explicit project bindings retain their containers." },
+    "globIgnorePaths": { "$ref": "#/$defs/strings" },
+    "syncRules": { "type": "array", "items": { "$ref": "#/$defs/syncRule" } },
+    "syncAuthority": { "type":"array", "description":"Class authority; omission inherits the outer list, [] restores legacy behavior. Studio/twoWay live sessions remain disabled until managed persistence and connection review are available.", "items":{"$ref":"#/$defs/classAuthority"} },
+    "syncbackRules": { "anyOf": [{ "$ref": "#/$defs/syncbackRules" }, { "type": "null" }] }
+  },
+  "$defs": {
+    "classAuthority": {
+      "type":"object", "additionalProperties":false, "required":["className","properties"],
+      "properties": {
+        "className":{"type":"string","minLength":1},
+        "properties":{"enum":["filesystem","studio","twoWay"]},
+        "structure":{"enum":["filesystem","twoWay"],"default":"filesystem"}
+      }
+    },
+    "strings": { "type": "array", "items": { "type": "string" } },
+    "ids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "uniqueItems": true },
+    "node": {
+      "type": "object",
+      "properties": {
+        "$className": { "type": ["string", "null"] },
+        "$id": { "type": ["string", "null"] },
+        "$properties": { "type": "object" },
+        "$attributes": { "type": "object" },
+        "$ruleDefaults": { "$ref": "#/$defs/ruleDefaultMask" },
+        "$ignoreUnknownInstances": {
+          "type": ["boolean", "null"],
+          "description": "Override preservation for this node only. Explicit metadata and this option override the inherited default."
+        },
+        "$ignoreUnknownDescendants": {
+          "type": ["boolean", "null"],
+          "description": "Preserve unknown Studio instances under this node and managed descendants. False ends inheritance and restores legacy per-node defaults; explicit per-node settings still win. This does not adopt instances or prevent managed deletions."
+        },
+        "$path": {
+          "anyOf": [
+            { "type": ["string", "null"] },
+            { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "Directory aggregation for sourcemaps only; no build, serve or syncback ownership." },
+            { "type": "object", "required": ["optional"], "properties": { "optional": { "type": "string" } } }
+          ]
+        }
+      },
+      "additionalProperties": { "$ref": "#/$defs/node" }
+    },
+    "syncRule": {
+      "type": "object",
+      "required": ["pattern"],
+      "anyOf": [{"required":["use"]},{"required":["defaults"],"properties":{"defaults":{"minProperties":1}}}],
+      "dependentRequired": {"suffix":["use"]},
+      "properties": {
+        "pattern": { "type": "string" },
+        "exclude": { "type": ["string", "null"] },
+        "suffix": { "type": ["string", "null"] },
+        "defaults": {"$ref":"#/$defs/ruleDefaults"},
+        "use": {
+          "enum": ["csv", "jsonModel", "json", "serverScript", "clientScript", "moduleScript", "pluginScript", "legacyClientScript", "legacyServerScript", "runContextServerScript", "runContextClientScript", "project", "rbxm", "rbxmx", "toml", "text", "textModule", "yaml", "ignore"]
+        }
+      }
+    },
+    "ruleDefaults": {
+      "type":"object", "additionalProperties":false,
+      "not":{"anyOf":[{"properties":{"properties":{"required":["Tags"]}},"required":["tags","properties"]},{"properties":{"properties":{"anyOf":[{"required":["Name"]},{"required":["Parent"]},{"required":["Source"]},{"required":["Value"]},{"required":["Contents"]},{"required":["Attributes"]}]}},"required":["properties"]}]},
+      "properties": {
+        "properties":{"type":"object"},"attributes":{"type":"object"},
+        "tags":{"$ref":"#/$defs/strings"}, "className":{"type":"string"},
+        "ignoreUnknownInstances":{"type":"boolean"}
+      }
+    },
+    "ruleDefaultMask": {
+      "type":"object", "additionalProperties":false,
+      "properties": {
+        "disabledProperties":{"$ref":"#/$defs/strings"},
+        "disabledAttributes":{"$ref":"#/$defs/strings"},
+        "disableClassName":{"type":"boolean"},
+        "disableIgnoreUnknownInstances":{"type":"boolean"}
+      }
+    },
+    "syncbackRules": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ignoreTrees": { "$ref": "#/$defs/strings" },
+        "ignoreClasses": { "$ref": "#/$defs/strings" },
+        "ignorePaths": { "$ref": "#/$defs/strings" },
+        "ignoreProperties": { "type": "object", "additionalProperties": { "$ref": "#/$defs/strings" } },
+        "syncCurrentCamera": { "type": ["boolean", "null"] },
+        "syncUnscriptable": { "type": ["boolean", "null"] },
+        "ignoreReferents": { "type": ["boolean", "null"] },
+        "createIgnoreDirPaths": { "type": ["boolean", "null"] }
+      }
+    }
+  }
+}

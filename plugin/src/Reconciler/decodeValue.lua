@@ -3,8 +3,7 @@
 	usable by Rojo's reconciler, potentially using RbxDom.
 ]]
 
-local Packages = script.Parent.Parent.Parent.Packages
-local RbxDom = require(Packages.RbxDom)
+local ValueCodec = require(script.Parent.Parent.ValueCodec)
 local Error = require(script.Parent.Error)
 
 local function decodeValue(encodedValue, instanceMap)
@@ -27,7 +26,7 @@ local function decodeValue(encodedValue, instanceMap)
 		end
 	end
 
-	local decodeSuccess, decodedValue = RbxDom.EncodedValue.decode(encodedValue)
+	local decodeSuccess, decodedValue = ValueCodec.decode(encodedValue)
 
 	if not decodeSuccess then
 		return false,

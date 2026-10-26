@@ -8,6 +8,17 @@ Use the following format:
 ```
 ## Unreleased
 
+* Preserve a model root's snapshot identity through `$path` project layers so self references and child references resolve to the final managed root, including nested projects, aliased model sources and reloads. ([#1292])
+
+* Add `syncbackRules.ignoreClasses` for classes and derived classes: retain their existing disk subtrees and required ancestors, omit new excluded input, and preserve embedded model values and reference identities. Reject ambiguous or unsafe reference preservation before writing files. ([#1299])
+
+* Report circular project references with their canonical path chain instead of overflowing the stack, while allowing independent aliases and later retries. ([#644])
+* Allow explicit `$path` bindings to init source files without importing sibling files, and avoid duplicate case-variant init children on Windows. ([#906], [#1016], [#1283])
+* Accept one leading UTF-8 byte order mark in JSON/JSONC projects, models, modules and metadata while preserving string contents and contextual parse errors. ([#1307])
+* Remove large instance batches with one stable sibling-list filter per parent, preserving metadata, references and surviving instance order through the local DOM fork. ([#1136])
+* Match large groups of snapshot children through ordered name/class candidate lists, avoiding repeated sibling scans while preserving duplicate and script-source identity rules. ([#1136])
+* Sync immutable MeshPart mesh content through Roblox's mesh-loading API while preserving instance identity, children, transforms and texture; support live changes and removal for both `MeshContent` and legacy `MeshId`. ([#1221])
+* Preserve Studio's active, unmanaged Workspace camera and viewpoint when connecting a fully managed project; explicitly managed cameras still follow project updates and deletions. ([#981])
 * Made a change to Rojo ([#0000])
 
 [#0000]:  https://github.com/rojo-rbx/rojo/pull/0000
@@ -31,9 +42,218 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## [8.0.0] (October 26th, 2026)
+
+Independent jonasvq fork based on upstream7.7.1; CLI and Studio plugin must both come from this fork. Release assets include guides/examples and checksums.
+
+* Add a runnable fully managed tutorial, cookbook and coding-agent guide, with a checked-in example, CLI roundtrips and bounded native Edit verification. ([#812], [#166])
+
+* Validate server handshakes before reading protocol, session or capability fields, even when optional typechecking is disabled. Report malformed or undecodable replies with the server URL and connection guidance instead of a scalar-indexing exception. ([#1302])
+
+* Keep additions whose managed parent is unavailable explicitly unapplied, including descendants, instead of throwing an invariant exception or creating orphans. Retain the subtree for retry and continue unrelated valid additions; report the missing parent context. ([#1094])
+
+* Warn when a built place contains StarterCharacterScripts without StarterPlayerScripts. Inspect the final tree, including model sources, and document explicit typed container declarations without inserting instances or changing defaults. ([#461])
+
+* Document local Windows CLI/Studio setup, version and capability distinctions, the fork8.0.0 Rokit pin, explicit quoted paths and command-not-found recovery. Include a clean-PATH/spaced-path verification helper without changing installed tools or user PATH. ([#1313], [#1339])
+
+* Clarify stored Model.Scale and baked geometry semantics, with native export/reify/update and JSON/XML/binary roundtrip coverage. Preserve valid exports without double scaling; document equivalent native exported state. ([#1343])
+
+* Honor class-specific property authority during explicit syncback: retain filesystem-owned properties and native source bytes while exporting Studio-owned descendants. Reject changed filesystem structure and unsafe reference preservation before writes; keep existing format and layout restrictions. ([#1301])
+
+* Preserve Studio-owned class properties during initial connection and live file updates through negotiated `classAuthorityV1`. Retain instance/reference identities, require explicit review for authority changes or destructive replacement, and protect serialized/topology recovery. Legacy clients refuse incompatible sessions. ([#1301])
+
+* Preserve inherited context for CSV snapshots without changing the CSV middleware. Keep custom CSV routes and instance identity on direct watch updates; apply inherited unknown-descendant preservation while retaining explicit metadata and shared-rule precedence. ([#1036])
+
+* Add optional inherited `syncAuthority` class policies. Explicit matching policies block legacy writes and Source-only receipts; check current project state before legacy mutations. Preserve nested overrides, embedded/CSV authority, offline build/stdin/syncback and JSONC destinations. ([#1301])
+
+* Add validated reusable class-authority types with exact/nearest-superclass precedence and strict configuration validation. ([#1301])
+
+* Remove deleted files and directory subtrees from their parent listings in the in-memory filesystem, matching native deletion and allowing clean recreation.
+
+* Repair moved/detached managed instances, reconstruct uncontested deleted subtrees and rebind exact copies under opt-in adoption before live updates. Preserve references, unknown descendants, selection and Undo; refuse ambiguous or dirty-source recovery before mutation and retain reconnect review for dirty copies. ([#296])
+
+* Apply project ignore globs and negations to absolute source bindings outside the project directory, including wildcard rules on other drives. Retain project-relative `../` patterns on the same drive. ([#907])
+
+* Add shared `syncRules.defaults` properties, attributes, tags and metadata, with independent routing, explicit override precedence and per-key removal masks. Preserve rule authority through syncback without per-file default copies; retain JSONC paths and reject lossy binary property columns. Apply live sync policy metadata without replacing healthy instances. ([#1036])
+
+* Add opt-in adoption of saved, untracked Studio instances during live sync after unique readable-property/subtree/reference checks. Preserve identities and unknown descendants; stop ambiguous conflicts before mutations or fallback. Serialization-only values remain unchanged and explicitly unverified. Preserve manual edits when refusing a patch. ([#673], [#1303])
+
+* Confirm opt-in two-way Source writes with bounded correlated persistence receipts and file readback; preserve newer local edits, expose conflicts for explicit review, and require confirmation after uncertain reconnects. Legacy servers report queued-only writes. General instance/property ownership remains separate. ([#293], [#295])
+
+* Extract reusable project tree, path and reflected value types into the local `rojo-project-types` crate, without filesystem, CLI, network or place-serializer dependencies. Preserve existing `librojo` exports and exact Rust type identity through re-exports. ([#508])
+
+* Make CLI and HTTP dependencies optional through a default-enabled `cli` feature. `default-features = false` retains the build, project, snapshot, syncback and wire-data APIs without the executable, transport or embedded-plugin build; standard CLI builds remain enabled. ([#1003])
+
+* Recognize `init.project.json/jsonc` directory entries only with explicit V2, report conflicting entries, retain default-project priority and explicit-file selection, and refresh directory roles after live alias/version changes without changing syncback destinations. ([#1323])
+
+* Add optional project `$version` 1/2. Explicit V2 defaults to modern scripts and inherited unknown-descendant preservation; unversioned projects retain their defaults, explicit overrides win, and reload/syncback retain the chosen semantics without migrating files. ([#706])
+
+* Add opt-in loopback automatic debugger plans with per-connection Studio consent, managed-source versions, bounded native stacks/locals/table inspection, typed numeric filters/evaluation and predetermined steps; revoke points/callbacks on lifecycle changes and expose bounded immutable reports. ([#1279])
+
+* Add the Windows `open` workflow to build or copy a place, serve on loopback and launch Studio with a one-session marker, guarded plugin installation and mandatory initial-sync confirmation. Preserve original places, existing output/plugin files and edited temporary places. ([#305])
+
+* Add explicit `textModule` sync rules for UTF-8 files, generating ModuleScripts that return exact text; support byte-preserving syncback/live writes of canonical literals and reject arbitrary code or incompatible layouts before writing. Existing CSV and text defaults remain unchanged. ([#1204])
+
+* Add opt-in inherited `ignoreEmptyDirectories` filtering for implicit physically empty directory trees, preserving explicit bindings and file markers, and keeping live/watch trees current after last-file removal and recreation. ([#969])
+
+* Add opt-in `build --compress lz4|zstd|none` for binary outputs, including watch, stdin and existing-place updates, while retaining LZ4 defaults and rejecting explicit compression for XML before writing. ([#1026])
+
+* Read project JSON/JSONC from stdin with `build -`, resolve sources from the current directory, and retain the in-memory project during watch builds without writing a temporary project file. ([#626])
+
+* Expose non-archivable `game.Rojo` discovery with per-plugin consent, scoped connection/status/settings/notification/context handles, explicit socket readiness and revocation/unload cleanup. ([#638], [#321])
+
+* Add opt-in Studio output forwarding with severity filters, bounded batches and current Lua source file/line mapping; stop forwarding on disconnect and retain compatibility with older servers/plugins. ([#1277])
+
+* Accept project stems such as `game` for `game.project.json` or `game.project.jsonc` across project-reading CLI commands, retaining existing path precedence and output/input filenames. ([#895])
+
+* Use Open Cloud for existing model updates and place publishing, with API-key validation, model operation polling and correct binary content types; deprecate and ignore cookie authentication without reading installed cookies. ([#1263], [#1141], [#926])
+
+* Add `build --input` for scoped updates of existing binary/XML places, preserving unmentioned properties and unowned areas, maintaining references and replacing output only after successful serialization. ([#1007], [#287])
+
+* Add `syncback --watch` with explicit repeated-write consent, coalesced input saves, recovery after incomplete input, fresh project reads and protection against overwriting its input. ([#1229])
+
+* Resolve relative syncback root directories from the project folder, preserving new children independently of the current working directory. ([#1229])
+
+* Isolate serialized fallback models so one broken asset does not block healthy replacements; restore references, preserve failed changes, and retain legacy-server support. ([#1115])
+
+* Disconnect when Studio changes to a place ID excluded by the connected project, reusing connection-time allow/deny checks and preventing further patch or write work; allowed and unrestricted ID changes remain connected. ([#1308])
+* Warn with instance and property paths when live sync skips a requested unreadable property, including guidance for serialization-only place settings. ([#874])
+* Wrap the last-update control below the version header in narrow plugin panels, returning to a single row when widened and accounting for longer prerelease version labels. ([#1158])
+* Stop patch-row animations and delayed expansion clicks after virtualized rows unmount, including removal during a height update, preventing Roact updates to destroyed UI. ([#759])
+* Skip queued tooltips whose trigger was removed during text measurement or virtualized scrolling, while continuing to render attached controls. ([#756])
+* Add a failures-only patch view with ancestor paths and failed properties, allowing quick inspection among many successful changes and a return to the full change list. ([#1230])
+* Add Cancel while connecting and stop pending startup work, preventing late responses or confirmation callbacks from applying changes, reconnecting or opening sockets after cancellation. ([#1171])
+* Ignore repeated Connect actions and repeated session starts, preventing duplicate API connections and sync lock claims while allowing a fresh retry after immediate startup failure. ([#1046])
+* Support explicit native Script/LocalScript metadata and faithful Lua syncback across emitter modes and script rules, preserving class, RunContext, source, children, IDs and existing Lua/JSONC paths; reject incompatible bindings and unsupported layout migrations before writes. ([#791], [#1078], [#1166])
+* Support nonempty directory arrays in `$path` for read-only sourcemaps, with canonical deduplication, recursive conflict-checked merges and watch regeneration across sources; build, serve and syncback reject array ownership. ([#1047])
+* Add loaded-project `build_project` and typed `write_project` library APIs, preserving caller edits, reference resolution and the CLI serializers without starting a server. ([#1001])
+* Add opt-in inherited `$ignoreUnknownDescendants` preservation with local metadata overrides, and warn with counts and paths before initial sync removes unknown Studio instances. Existing defaults and managed deletions are preserved. ([#716], [#919])
+* Accept matching class declarations in project nodes and filesystem metadata while continuing to reject conflicting classes. ([#197])
+* Warn with file and node paths for ignored model/metadata fields, including a correction for project-style `$properties`; retain supported tag handling and JSONC metadata paths. ([#1017])
+* Accept unsigned 32-bit integer enum values in project, model and metadata properties, retaining named/qualified enums and rejecting invalid numeric values. ([#1139])
+* Bound HTTP API request bodies to 64 MiB by default, with a positive `serve --max-request-body-bytes` override and structured HTTP 413 errors before parsing oversized bodies. ([#1275])
+* Expose normalized source file paths on API reads with `?showPaths=true`, including embedded model children, while retaining the default response and public Rust structs. ([#335])
+* Add opt-in `sourcemap --relative-to-output` for output-directory-relative file paths, including watch mode, while preserving the default project-relative paths. ([#999])
+* Add opt-in `sourcemap --include-run-context` with reflected names and raw values for Script nodes, including property-only watch updates and default/unknown values. Existing class names and default output stay unchanged. ([#1317])
+* Preserve Studio-only script descendants when toggling `emitLegacyScripts` for an unchanged, unambiguous script source. ([#925])
+* Batch rapid `build --watch` changes into a bounded collection window to avoid exporting once per changed file. ([#577])
+* Avoid accumulating duplicate ignore rules when projects are re-snapshotted, preserving negation priority and each rule's base path. ([#1018])
+* Support TweenInfo attributes using the local codec fork, preserving mixed attributes and avoiding repeated sync differences. Both server and plugin must support the negotiated extension. ([#1336])
+* Preserve legacy MeshPart mass when binary output combines models with and without stored volume data. ([#1312])
+* Keep live reference properties consistent with the final tree when targets are added, changed, removed, or ambiguous, and correctly apply explicit nil references. ([#1292])
+* Avoid recurring plugin batcher errors for reference and unsupported property encoders; use tracked IDs for reference encoding and report untracked targets without blocking later source updates. ([#1304])
+* Preserve parents of Init-named scripts and localization tables during syncback by using their directory representation for reserved filenames. ([#1195])
+* Preserve existing directory contents and reject file collisions in memofs in-memory `create_dir_all`. ([#1166])
+* Allow duplicate Studio-only children beneath project nodes without `$path` during syncback, while still rejecting ambiguous or missing managed children. ([#1180])
+* Keep new children inside mapped model files during syncback instead of attempting to write paths beneath those files. ([#1225])
+* Serialize syncback metadata and JSON-model properties and attributes in stable lexical order. ([#1245])
+* Warn at session startup when the root project maps the same canonical `$path` to multiple nodes, retaining intentional aliases. ([#475])
+* Added opt-in filesystem operation and watcher diagnostics through the `memofs` log target. ([#747])
+* Reject invalid Windows build output names instead of reporting successful builds into alternate data streams or device files. ([#660])
+* Report an actionable error before attempting a legacy place upload, directing users to Open Cloud authentication. ([#931])
+* Include active filesystem event, project, and build output paths in crash diagnostics. ([#932])
+* Report a contextual error for directory paths without a name, such as drive roots, instead of panicking during snapshot selection. ([#932])
+* Return a contextual API error when serializing an instance fails, keeping the serve session usable. ([#932])
+* Reject API writes with an actionable error if the change processor has stopped, instead of panicking on a closed channel. ([#932])
+* Report the source and project paths when syncback cannot determine the root path's middleware, instead of panicking. ([#932])
+* Preserve known instance identities when reconnecting to the same live server, so offline class changes and deletions do not leave stale or duplicate instances. Unknown-instance rules remain unchanged. ([#1009])
+* Fixed delayed live-sync additions crashing after deletion or including later changes and duplicate children. ([#1070])
+* Fixed syncback crashing when removing an embedded child from a model referenced by a project node. ([#1121])
+* Fixed a subscription race that could leave connected clients waiting until another change arrived. ([#1136])
+* Explain unexpected plugin disconnections with the server address and restart/reconnect guidance, retaining transport error details. ([#1240])
+* Fixed plugin source updates writing to a directory instead of its init script, and publishing changes when writing the source failed. ([#1206])
+* Return structured request errors instead of panicking when an API request body is aborted or cannot be read. ([#1275])
+* Avoided redundant metadata patches for unchanged instances with `Rojo_Id` attributes. ([#1292])
+* Fixed lost filesystem watches after failed registration or deletion and recreation of mapped directories. ([#1309])
+* Fixed live-sync crashes when event targets or their parent directories disappear during rapid edits, and when the root source is temporarily removed. ([#1314])
+* Reset removed properties in Studio through a negotiated live-sync extension, including reference properties, attributes, and tags. Both the server and plugin must support the extension. ([#1332])
 * LocalizationTables no longer report as changed when nothing changes. [(#1333)]
 
+[8.0.0]: https://github.com/jonasvq/rojo/releases/tag/v8.0.0
+
+[#164]: https://github.com/rojo-rbx/rojo/issues/164
+[#166]: https://github.com/rojo-rbx/rojo/issues/166
+[#197]: https://github.com/rojo-rbx/rojo/issues/197
+[#293]: https://github.com/rojo-rbx/rojo/issues/293
+[#295]: https://github.com/rojo-rbx/rojo/issues/295
+[#296]: https://github.com/rojo-rbx/rojo/issues/296
+[#305]: https://github.com/rojo-rbx/rojo/issues/305
+[#321]: https://github.com/rojo-rbx/rojo/issues/321
+[#335]: https://github.com/rojo-rbx/rojo/issues/335
+[#461]: https://github.com/rojo-rbx/rojo/issues/461
+[#475]: https://github.com/rojo-rbx/rojo/issues/475
+[#508]: https://github.com/rojo-rbx/rojo/issues/508
+[#577]: https://github.com/rojo-rbx/rojo/issues/577
+[#626]: https://github.com/rojo-rbx/rojo/issues/626
+[#638]: https://github.com/rojo-rbx/rojo/issues/638
+[#644]: https://github.com/rojo-rbx/rojo/issues/644
+[#660]: https://github.com/rojo-rbx/rojo/issues/660
+[#673]: https://github.com/rojo-rbx/rojo/issues/673
+[#706]: https://github.com/rojo-rbx/rojo/issues/706
+[#716]: https://github.com/rojo-rbx/rojo/issues/716
+[#747]: https://github.com/rojo-rbx/rojo/issues/747
+[#756]: https://github.com/rojo-rbx/rojo/issues/756
+[#759]: https://github.com/rojo-rbx/rojo/issues/759
+[#791]: https://github.com/rojo-rbx/rojo/issues/791
+[#812]: https://github.com/rojo-rbx/rojo/issues/812
+[#874]: https://github.com/rojo-rbx/rojo/issues/874
+[#906]: https://github.com/rojo-rbx/rojo/issues/906
+[#907]: https://github.com/rojo-rbx/rojo/issues/907
+[#919]: https://github.com/rojo-rbx/rojo/issues/919
+[#925]: https://github.com/rojo-rbx/rojo/issues/925
+[#931]: https://github.com/rojo-rbx/rojo/issues/931
+[#932]: https://github.com/rojo-rbx/rojo/issues/932
+[#969]: https://github.com/rojo-rbx/rojo/issues/969
+[#981]: https://github.com/rojo-rbx/rojo/issues/981
+[#999]: https://github.com/rojo-rbx/rojo/issues/999
+[#1003]: https://github.com/rojo-rbx/rojo/issues/1003
+[#1009]: https://github.com/rojo-rbx/rojo/issues/1009
+[#1016]: https://github.com/rojo-rbx/rojo/issues/1016
+[#1001]: https://github.com/rojo-rbx/rojo/issues/1001
+[#1017]: https://github.com/rojo-rbx/rojo/issues/1017
+[#1018]: https://github.com/rojo-rbx/rojo/issues/1018
+[#1026]: https://github.com/rojo-rbx/rojo/issues/1026
+[#1046]: https://github.com/rojo-rbx/rojo/issues/1046
+[#1047]: https://github.com/rojo-rbx/rojo/issues/1047
+[#1070]: https://github.com/rojo-rbx/rojo/issues/1070
+[#1078]: https://github.com/rojo-rbx/rojo/issues/1078
+[#1094]: https://github.com/rojo-rbx/rojo/issues/1094
+[#1121]: https://github.com/rojo-rbx/rojo/issues/1121
+[#1136]: https://github.com/rojo-rbx/rojo/issues/1136
+[#1139]: https://github.com/rojo-rbx/rojo/issues/1139
+[#1206]: https://github.com/rojo-rbx/rojo/issues/1206
+[#1158]: https://github.com/rojo-rbx/rojo/issues/1158
+[#1166]: https://github.com/rojo-rbx/rojo/issues/1166
+[#1171]: https://github.com/rojo-rbx/rojo/issues/1171
+[#1180]: https://github.com/rojo-rbx/rojo/issues/1180
+[#1195]: https://github.com/rojo-rbx/rojo/issues/1195
+[#1221]: https://github.com/rojo-rbx/rojo/issues/1221
+[#1225]: https://github.com/rojo-rbx/rojo/issues/1225
+[#1240]: https://github.com/rojo-rbx/rojo/issues/1240
+[#1230]: https://github.com/rojo-rbx/rojo/issues/1230
+[#1245]: https://github.com/rojo-rbx/rojo/issues/1245
+[#1275]: https://github.com/rojo-rbx/rojo/issues/1275
+[#1277]: https://github.com/rojo-rbx/rojo/issues/1277
+[#1283]: https://github.com/rojo-rbx/rojo/issues/1283
+[#1292]: https://github.com/rojo-rbx/rojo/issues/1292
+[#1299]: https://github.com/rojo-rbx/rojo/issues/1299
+[#1301]: https://github.com/rojo-rbx/rojo/issues/1301
+[#1302]: https://github.com/rojo-rbx/rojo/issues/1302
+[#1303]: https://github.com/rojo-rbx/rojo/issues/1303
+[#1307]: https://github.com/rojo-rbx/rojo/issues/1307
+[#1304]: https://github.com/rojo-rbx/rojo/issues/1304
+[#1308]: https://github.com/rojo-rbx/rojo/issues/1308
+[#1309]: https://github.com/rojo-rbx/rojo/issues/1309
+[#1312]: https://github.com/rojo-rbx/rojo/issues/1312
+[#1313]: https://github.com/rojo-rbx/rojo/issues/1313
+[#1314]: https://github.com/rojo-rbx/rojo/issues/1314
+[#1323]: https://github.com/rojo-rbx/rojo/issues/1323
+[#1317]: https://github.com/rojo-rbx/rojo/issues/1317
+[#1339]: https://github.com/rojo-rbx/rojo/issues/1339
+[#1343]: https://github.com/rojo-rbx/rojo/issues/1343
+[#1332]: https://github.com/rojo-rbx/rojo/issues/1332
 [#1333]: https://github.com/rojo-rbx/rojo/pull/1333
+[#1336]: https://github.com/rojo-rbx/rojo/issues/1336
 
 ## [7.7.1] (October 1st, 2026)
 
@@ -167,6 +387,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 [7.6.0]: https://github.com/rojo-rbx/rojo/releases/tag/v7.6.0
 [#1030]: https://github.com/rojo-rbx/rojo/pull/1030
+[#1036]: https://github.com/rojo-rbx/rojo/issues/1036
 [#1066]: https://github.com/rojo-rbx/rojo/pull/1066
 [#1069]: https://github.com/rojo-rbx/rojo/pull/1069
 [#1080]: https://github.com/rojo-rbx/rojo/pull/1080
@@ -1333,3 +1554,19 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 * Initial release, functionally very similar to [rbxfs](https://github.com/LPGhatguy/rbxfs)
 
 [0.1.0]: https://github.com/rojo-rbx/rojo/releases/tag/v0.1.0
+
+[#1115]: https://github.com/rojo-rbx/rojo/issues/1115
+
+[#1204]: https://github.com/rojo-rbx/rojo/issues/1204
+[#1229]: https://github.com/rojo-rbx/rojo/issues/1229
+
+[#1007]: https://github.com/rojo-rbx/rojo/issues/1007
+[#287]: https://github.com/rojo-rbx/rojo/issues/287
+
+[#1263]: https://github.com/rojo-rbx/rojo/issues/1263
+[#1141]: https://github.com/rojo-rbx/rojo/issues/1141
+[#926]: https://github.com/rojo-rbx/rojo/issues/926
+
+[#895]: https://github.com/rojo-rbx/rojo/issues/895
+
+[#1279]: https://github.com/rojo-rbx/rojo/issues/1279

@@ -4,7 +4,7 @@ local RbxDom = require(Packages.RbxDom)
 
 local encodeProperty = require(script.Parent.encodeProperty)
 
-return function(instance, instanceId, properties)
+return function(instance, instanceId, properties, instanceMap)
 	local update = {
 		id = instanceId,
 		changedProperties = {},
@@ -21,7 +21,7 @@ return function(instance, instanceId, properties)
 				continue
 			end
 
-			local encodeSuccess, encodeResult = encodeProperty(instance, propertyName, descriptor)
+			local encodeSuccess, encodeResult = encodeProperty(instance, propertyName, descriptor, instanceMap)
 
 			if not encodeSuccess then
 				Log.debug("Could not sync back property {:?}.{}: {}", instance, propertyName, encodeResult)

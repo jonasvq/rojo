@@ -13,6 +13,131 @@ use crate::rojo_test::{
 use librojo::web_api::{SerializeResponse, SocketPacketType};
 
 #[test]
+fn api_read_source_paths_cover_aliases_metadata_and_embedded_children() {
+    run_serve_test("api_source_paths", |session, _| {
+        let root = session.get_api_rojo().unwrap().root_instance_id;
+        let url = format!(
+            "http://localhost:{}/api/read/{root}?showPaths=true",
+            session.port()
+        );
+        let response = reqwest::blocking::get(url).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.bytes().unwrap();
+        let legacy: librojo::web_api::ReadResponse = deserialize_msgpack(&bytes).unwrap();
+        let value: serde_json::Value = deserialize_msgpack(&bytes).unwrap();
+        let instances = value["instances"].as_object().unwrap();
+        assert_eq!(instances.len(), legacy.instances.len());
+        let paths_for = |name: &str| {
+            instances
+                .values()
+                .find(|instance| instance["Name"] == name)
+                .unwrap()["FilePaths"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let script_paths = paths_for("script");
+        let alias_paths = paths_for("Alias");
+        assert!(script_paths.iter().all(|path| alias_paths.contains(path)));
+        assert_eq!(alias_paths.len(), script_paths.len() + 1);
+        assert!(alias_paths
+            .iter()
+            .any(|path| path.as_str().unwrap().ends_with("/default.project.json")));
+        assert!(script_paths
+            .iter()
+            .any(|path| path.as_str().unwrap().ends_with("/src/script.luau")));
+        assert!(script_paths
+            .iter()
+            .any(|path| path.as_str().unwrap().ends_with("/src/script.meta.json")));
+        assert_eq!(paths_for("Embedded"), paths_for("model"));
+        assert_eq!(paths_for("Deep"), paths_for("model"));
+        assert!(paths_for("Configured")[0]
+            .as_str()
+            .unwrap()
+            .ends_with("/default.project.json"));
+        for instance in instances.values() {
+            let paths = instance["FilePaths"].as_array().unwrap();
+            let mut sorted = paths.clone();
+            sorted.sort_by(|left, right| left.as_str().unwrap().cmp(right.as_str().unwrap()));
+            sorted.dedup();
+            assert_eq!(*paths, sorted);
+            for path in paths {
+                let path = path.as_str().unwrap();
+                assert!(!path.contains('\\'));
+                assert!(
+                    std::path::Path::new(path).is_absolute()
+                        && std::path::Path::new(path).is_file()
+                );
+                assert!(
+                    !path.ends_with(".meta.jsonc"),
+                    "missing candidate metadata leaked"
+                );
+            }
+        }
+        let sub = legacy
+            .instances
+            .iter()
+            .find(|(_, instance)| instance.name == "Embedded")
+            .unwrap()
+            .0;
+        let response = reqwest::blocking::get(format!(
+            "http://localhost:{}/api/read/{sub},{sub}?showPaths=true",
+            session.port()
+        ))
+        .unwrap()
+        .bytes()
+        .unwrap();
+        let sub: serde_json::Value = deserialize_msgpack(&response).unwrap();
+        assert_eq!(sub["instances"].as_object().unwrap().len(), 2);
+        for instance in sub["instances"].as_object().unwrap().values() {
+            assert_eq!(
+                instance["FilePaths"].as_array().unwrap(),
+                &paths_for("model")
+            );
+        }
+    });
+}
+
+#[test]
+fn explicit_init_file_updates_live_without_importing_siblings() {
+    use rbx_dom_weak::types::Variant;
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    run_serve_test("explicit_init_file", |session, _| {
+        let root = session.get_api_rojo().unwrap().root_instance_id;
+        let initial = session.get_api_read(root).unwrap();
+        assert_eq!(initial.instances.len(), 2);
+        let selected = initial.instances[&root].children[0];
+        assert_eq!(initial.instances[&selected].name, "Selected");
+        assert_eq!(initial.instances[&selected].class_name, "ModuleScript");
+        assert!(initial.instances[&selected].children.is_empty());
+        fs::write(session.path().join("src/init.luau"), "return 99").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let read = session.get_api_read(root).unwrap();
+            if read
+                .instances
+                .get(&selected)
+                .and_then(|instance| instance.properties.get(&rbx_dom_weak::ustr("Source")))
+                .map(|value| value.as_ref())
+                == Some(&Variant::String("return 99".into()))
+            {
+                assert_eq!(read.instances.len(), 2);
+                assert!(read.instances[&selected].children.is_empty());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "explicit init file update lost identity or did not converge"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    });
+}
+
+#[test]
 fn rejects_dns_rebinding_requests() {
     run_serve_test("empty", |session, _redactions| {
         let port = session.port();

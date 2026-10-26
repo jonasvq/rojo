@@ -1,16 +1,12 @@
+mod cloud;
+
 use std::path::PathBuf;
 
 use anyhow::{bail, Context};
 use clap::Parser;
 use memofs::Vfs;
-use reqwest::{
-    header::{ACCEPT, CONTENT_TYPE, COOKIE, USER_AGENT},
-    StatusCode,
-};
 
-use crate::{auth_cookie::get_auth_cookie, serve_session::ServeSession};
-
-use super::resolve_path;
+use super::resolve_project_path;
 
 /// Builds the project and uploads it to Roblox.
 #[derive(Debug, Parser)]
@@ -19,15 +15,15 @@ pub struct UploadCommand {
     #[clap(default_value = "")]
     pub project: PathBuf,
 
-    /// Authenication cookie to use. If not specified, Rojo will attempt to find one from the system automatically.
+    /// Deprecated and ignored. Use an Open Cloud API key.
     #[clap(long)]
     pub cookie: Option<String>,
 
-    /// API key obtained from create.roblox.com/credentials. Rojo will use the Open Cloud API when this is provided. Only supports uploading to a place.
+    /// Open Cloud API key for updating an existing model or publishing a place.
     #[clap(long = "api_key")]
     pub api_key: Option<String>,
 
-    /// The Universe ID of the given place. Required when using the Open Cloud API.
+    /// Universe ID for place publishing. Must be omitted for model updates.
     #[clap(long = "universe_id")]
     pub universe_id: Option<u64>,
 
@@ -37,132 +33,175 @@ pub struct UploadCommand {
 }
 
 impl UploadCommand {
-    pub fn run(self) -> Result<(), anyhow::Error> {
-        let project_path = resolve_path(&self.project)?;
-
+    pub fn run(self) -> anyhow::Result<()> {
+        let project_path = resolve_project_path(&self.project)?;
         let vfs = Vfs::new_default()?;
+        vfs.set_watch_enabled(false);
+        let project = crate::Project::load_initial_project(&vfs, &project_path)?;
+        let tree = crate::build_project(&vfs, &project)?;
+        let root = tree.inner().root();
+        if self.cookie.is_some() {
+            log::warn!(
+                "--cookie is deprecated and ignored. Uploads require an Open Cloud --api_key."
+            );
+        }
+        let target = self.target(root.class == "DataModel")?;
+        let client = cloud::Cloud::new(self.api_key.as_deref().unwrap())?;
+        let bytes = encode_tree(&tree)?;
+        client.upload(bytes, target)
+    }
 
-        let session = ServeSession::new(vfs, project_path)?;
-
-        let tree = session.tree();
-        let inner_tree = tree.inner();
-        let root = inner_tree.root();
-
-        let encode_ids = match root.class.as_str() {
-            "DataModel" => root.children().to_vec(),
-            _ => vec![root.referent()],
-        };
-
-        let mut buffer = Vec::new();
-
-        log::trace!("Encoding binary model");
-        rbx_binary::to_writer(&mut buffer, tree.inner(), &encode_ids)?;
-
-        match (self.cookie, self.api_key, self.universe_id) {
-            (cookie, None, universe) => {
-                // using legacy. notify if universe is provided.
-                if universe.is_some() {
-                    log::warn!(
-                        "--universe_id was provided but is ignored when using legacy upload"
-                    );
-                }
-
-                let cookie = cookie.or_else(get_auth_cookie).context(
-                    "Rojo could not find your Roblox auth cookie. Please pass one via --cookie.",
-                )?;
-                do_upload(buffer, self.asset_id, &cookie)
+    fn target(&self, place: bool) -> anyhow::Result<cloud::Target> {
+        if self.api_key.is_none() {
+            if place {
+                bail!("Place uploads require Open Cloud. Pass --api_key and --universe_id; legacy cookies are no longer supported.");
             }
-
-            (cookie, Some(api_key), Some(universe_id)) => {
-                // using open cloud. notify if cookie is provided.
-                if cookie.is_some() {
-                    log::warn!("--cookie was provided but is ignored when using Open Cloud API");
-                }
-
-                do_upload_open_cloud(buffer, universe_id, self.asset_id, &api_key)
-            }
-
-            (_, Some(_), None) => {
-                // API key is provided, universe id is not.
-                bail!("--universe_id must be provided to use the Open Cloud API");
-            }
+            bail!("Model uploads require Open Cloud. Pass --api_key; legacy cookies are no longer supported.");
+        }
+        anyhow::ensure!(
+            !self.api_key.as_deref().unwrap().trim().is_empty(),
+            "--api_key must not be empty"
+        );
+        anyhow::ensure!(self.asset_id > 0, "--asset_id must be positive");
+        if place {
+            let universe_id = self
+                .universe_id
+                .context("--universe_id must be provided for place uploads")?;
+            anyhow::ensure!(universe_id > 0, "--universe_id must be positive");
+            Ok(cloud::Target::Place {
+                universe_id,
+                asset_id: self.asset_id,
+            })
+        } else {
+            anyhow::ensure!(
+                self.universe_id.is_none(),
+                "--universe_id is only valid for place uploads, not models"
+            );
+            Ok(cloud::Target::Model {
+                asset_id: self.asset_id,
+            })
         }
     }
 }
 
-fn do_upload(buffer: Vec<u8>, asset_id: u64, cookie: &str) -> anyhow::Result<()> {
-    let url = format!(
-        "https://data.roblox.com/Data/Upload.ashx?assetid={}",
-        asset_id
-    );
-
-    let client = reqwest::blocking::Client::new();
-
-    let build_request = move || {
-        client
-            .post(&url)
-            .header(COOKIE, format!(".ROBLOSECURITY={}", cookie))
-            .header(USER_AGENT, "Roblox/WinInet")
-            .header(CONTENT_TYPE, "application/xml")
-            .header(ACCEPT, "application/json")
-            .body(buffer.clone())
+fn encode_tree(tree: &crate::RojoTree) -> anyhow::Result<Vec<u8>> {
+    let root = tree.inner().root();
+    let root_id = [root.referent()];
+    let ids = if root.class == "DataModel" {
+        root.children()
+    } else {
+        &root_id
     };
+    let mut bytes = Vec::new();
+    crate::binary_serialization::to_writer(&mut bytes, tree.inner(), ids)?;
+    Ok(bytes)
+}
 
-    log::debug!("Uploading to Roblox...");
-    let mut response = build_request().send()?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{InstanceSnapshot, RojoTree};
+    use rbx_dom_weak::types::Variant;
 
-    // Starting in Feburary, 2021, the upload endpoint performs CSRF challenges.
-    // If we receive an HTTP 403 with a X-CSRF-Token reply, we should retry the
-    // request, echoing the value of that header.
-    if response.status() == StatusCode::FORBIDDEN {
-        if let Some(csrf_token) = response.headers().get("X-CSRF-Token") {
-            log::debug!("Received CSRF challenge, retrying with token...");
-            response = build_request().header("X-CSRF-Token", csrf_token).send()?;
+    fn command(key: Option<&str>, universe: Option<u64>, asset_id: u64) -> UploadCommand {
+        UploadCommand {
+            project: PathBuf::new(),
+            cookie: Some("IGNORED_TEST_COOKIE".into()),
+            api_key: key.map(str::to_owned),
+            universe_id: universe,
+            asset_id,
         }
     }
 
-    let status = response.status();
-    if !status.is_success() {
-        bail!(
-            "The Roblox API returned an unexpected error: {}",
-            response.text()?
-        );
+    #[test]
+    fn upload_mode_and_identifiers_are_validated_before_transport() {
+        assert!(matches!(
+            command(Some("key"), None, 42).target(false).unwrap(),
+            cloud::Target::Model { asset_id: 42 }
+        ));
+        assert!(matches!(
+            command(Some("key"), Some(10), 42).target(true).unwrap(),
+            cloud::Target::Place {
+                universe_id: 10,
+                asset_id: 42
+            }
+        ));
+        for (place, key, universe, id) in [
+            (false, None, None, 42),
+            (true, None, Some(10), 42),
+            (false, Some(" "), None, 42),
+            (true, Some("key"), None, 42),
+            (true, Some("key"), Some(0), 42),
+            (false, Some("key"), Some(10), 42),
+            (false, Some("key"), None, 0),
+        ] {
+            assert!(command(key, universe, id).target(place).is_err());
+        }
     }
 
-    Ok(())
-}
-
-/// Implementation of do_upload that supports the new open cloud api.
-/// see https://developer.roblox.com/en-us/articles/open-cloud
-fn do_upload_open_cloud(
-    buffer: Vec<u8>,
-    universe_id: u64,
-    asset_id: u64,
-    api_key: &str,
-) -> anyhow::Result<()> {
-    let url = format!(
-        "https://apis.roblox.com/universes/v1/{}/places/{}/versions?versionType=Published",
-        universe_id, asset_id
-    );
-
-    let client = reqwest::blocking::Client::new();
-
-    log::debug!("Uploading to Roblox...");
-    let response = client
-        .post(url)
-        .header("x-api-key", api_key)
-        .header(CONTENT_TYPE, "application/xml")
-        .header(ACCEPT, "application/json")
-        .body(buffer)
-        .send()?;
-
-    let status = response.status();
-    if !status.is_success() {
-        bail!(
-            "The Roblox API returned an unexpected error: {}",
-            response.text()?
-        );
+    #[test]
+    fn model_payload_includes_root_but_place_payload_contains_only_children() {
+        for class in ["Folder", "DataModel"] {
+            let tree = RojoTree::new(
+                InstanceSnapshot::new()
+                    .name("ProjectRoot")
+                    .class_name(class)
+                    .children(vec![InstanceSnapshot::new()
+                        .name("Child")
+                        .class_name("StringValue")
+                        .property("Value", "data")]),
+            );
+            let bytes = encode_tree(&tree).unwrap();
+            let dom = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+            let roots = dom.root().children();
+            assert_eq!(roots.len(), 1);
+            let root = dom.get_by_ref(roots[0]).unwrap();
+            assert_eq!(
+                root.name,
+                if class == "DataModel" {
+                    "Child"
+                } else {
+                    "ProjectRoot"
+                }
+            );
+            let child = dom
+                .descendants()
+                .find(|instance| instance.name == "Child")
+                .unwrap();
+            assert_eq!(
+                child.properties.get(&"Value".into()),
+                Some(&Variant::String("data".into()))
+            );
+        }
     }
 
-    Ok(())
+    #[test]
+    fn upload_payload_uses_legacy_mesh_volume_fidelity_defaults() {
+        let tree = RojoTree::new(
+            InstanceSnapshot::new()
+                .name("Root")
+                .class_name("Folder")
+                .children(vec![
+                    InstanceSnapshot::new()
+                        .name("Legacy")
+                        .class_name("MeshPart"),
+                    InstanceSnapshot::new()
+                        .name("Modern")
+                        .class_name("MeshPart")
+                        .property("UnscaledVolume", 12.0_f32),
+                ]),
+        );
+        let bytes = encode_tree(&tree).unwrap();
+        let dom = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+        for (name, value) in [("Legacy", 0.0_f32), ("Modern", 12.0_f32)] {
+            let instance = dom
+                .descendants()
+                .find(|instance| instance.name == name)
+                .unwrap();
+            assert_eq!(
+                instance.properties.get(&"UnscaledVolume".into()),
+                Some(&Variant::Float32(value))
+            );
+        }
+    }
 }

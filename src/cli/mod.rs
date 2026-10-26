@@ -4,6 +4,7 @@ mod build;
 mod doc;
 mod fmt_project;
 mod init;
+mod open;
 mod plugin;
 mod serve;
 mod sourcemap;
@@ -16,10 +17,11 @@ use anyhow::Context;
 use clap::Parser;
 use thiserror::Error;
 
-pub use self::build::BuildCommand;
+pub use self::build::{BuildCommand, BuildCompression};
 pub use self::doc::DocCommand;
 pub use self::fmt_project::FmtProjectCommand;
 pub use self::init::{InitCommand, InitKind};
+pub use self::open::OpenCommand;
 pub use self::plugin::{PluginCommand, PluginSubcommand};
 pub use self::serve::ServeCommand;
 pub use self::sourcemap::SourcemapCommand;
@@ -40,10 +42,12 @@ pub struct Options {
 
 impl Options {
     pub fn run(self) -> anyhow::Result<()> {
+        crate::diagnostic_context::install();
         match self.subcommand {
             Subcommand::Init(subcommand) => subcommand.run(),
             Subcommand::Serve(subcommand) => subcommand.run(self.global),
             Subcommand::Build(subcommand) => subcommand.run(),
+            Subcommand::Open(subcommand) => subcommand.run(self.global),
             Subcommand::Upload(subcommand) => subcommand.run(),
             Subcommand::Sourcemap(subcommand) => subcommand.run(),
             Subcommand::FmtProject(subcommand) => subcommand.run(),
@@ -118,6 +122,7 @@ pub enum Subcommand {
     Init(InitCommand),
     Serve(ServeCommand),
     Build(BuildCommand),
+    Open(OpenCommand),
     Upload(UploadCommand),
     Sourcemap(SourcemapCommand),
     FmtProject(FmtProjectCommand),
@@ -136,4 +141,32 @@ pub(super) fn resolve_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {
         )?;
         Ok(Cow::Owned(current_dir.join(path)))
     }
+}
+
+/// CLI shorthand applies only to project inputs, never output or Roblox files.
+pub(super) fn resolve_project_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {
+    let path = resolve_path(path)?;
+    match fs_err::symlink_metadata(&path) {
+        Ok(_) => return Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if crate::Project::is_project_file(&path) {
+        return Ok(path);
+    }
+    // Keep the same JSON-before-JSONC preference as default project discovery.
+    for suffix in [".project.json", ".project.jsonc"] {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        let candidate = std::path::PathBuf::from(candidate);
+        match fs_err::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Ok(Cow::Owned(candidate))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(path)
 }

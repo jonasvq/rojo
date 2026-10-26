@@ -21,6 +21,98 @@ return function()
 		return len
 	end
 
+	it("should preserve the unmanaged Workspace CurrentCamera while removing other unknown children", function()
+		local workspace = game:GetService("Workspace")
+		local previousCamera = workspace.CurrentCamera
+		local knownInstances = InstanceMap.new()
+		local virtualInstances = {
+			ROOT = {
+				ClassName = "Workspace",
+				Name = workspace.Name,
+				Properties = {},
+				Children = {},
+				Metadata = { ignoreUnknownInstances = false },
+			},
+		}
+		-- Keep the test place's existing children outside this fixture's removals.
+		for index, child in workspace:GetChildren() do
+			local id = "EXISTING" .. index
+			knownInstances:insert(id, child)
+			virtualInstances.ROOT.Children[index] = id
+			virtualInstances[id] = {
+				ClassName = child.ClassName,
+				Name = child.Name,
+				Properties = {},
+				Children = {},
+				Metadata = { ignoreUnknownInstances = true },
+			}
+		end
+		local camera = Instance.new("Camera")
+		camera.Name = "RojoCurrentCameraRegression"
+		camera.CFrame = CFrame.new(17, 23, 41)
+		camera.Parent = workspace
+		workspace.CurrentCamera = camera
+		local unknown = Instance.new("Folder")
+		unknown.Parent = workspace
+		local inactiveCamera = Instance.new("Camera")
+		inactiveCamera.Parent = workspace
+		knownInstances:insert("ROOT", workspace)
+		local ok, patch = diff(knownInstances, virtualInstances, "ROOT")
+		local applyPatch = require(script.Parent.applyPatch)
+		local unapplied = applyPatch(knownInstances, patch)
+		local retainedCamera = workspace.CurrentCamera == camera and camera.Parent == workspace
+		local retainedView = camera.CFrame == CFrame.new(17, 23, 41)
+		-- Restore Studio state even when the regression assertion fails.
+		workspace.CurrentCamera = previousCamera
+		camera:Destroy()
+		unknown:Destroy()
+		inactiveCamera:Destroy()
+		assert(ok, tostring(patch))
+		assert(table.find(patch.removed, unknown), "ordinary unknown children must still be removed")
+		assert(table.find(patch.removed, inactiveCamera), "inactive unknown cameras must still be removed")
+		assert(not table.find(patch.removed, camera), "CurrentCamera must not be removed")
+		assert(retainedCamera and retainedView, "applying the connect patch must preserve camera and viewpoint")
+		assert(PatchSet.isEmpty(unapplied), "the connect patch must apply fully")
+	end)
+
+	it("should still update and delete a managed CurrentCamera", function()
+		local workspace = game:GetService("Workspace")
+		local previousCamera = workspace.CurrentCamera
+		local camera = Instance.new("Camera")
+		camera.Parent = workspace
+		workspace.CurrentCamera = camera
+		local knownInstances = InstanceMap.new()
+		knownInstances:insert("ROOT", workspace)
+		knownInstances:insert("CAMERA", camera)
+		local virtualInstances = {
+			ROOT = {
+				ClassName = "Workspace",
+				Name = workspace.Name,
+				Properties = {},
+				Children = { "CAMERA" },
+				Metadata = { ignoreUnknownInstances = true },
+			},
+			CAMERA = {
+				ClassName = "Camera",
+				Name = camera.Name,
+				Properties = { FieldOfView = { Float32 = 42 } },
+				Children = {},
+			},
+		}
+		local ok, patch = diff(knownInstances, virtualInstances, "ROOT")
+		virtualInstances.ROOT.Children = {}
+		virtualInstances.CAMERA = nil
+		local deleteOk, deletePatch = diff(knownInstances, virtualInstances, "ROOT")
+		workspace.CurrentCamera = previousCamera
+		camera:Destroy()
+		assert(ok, tostring(patch))
+		expect(#patch.updated).to.equal(1)
+		expect(patch.updated[1].id).to.equal("CAMERA")
+		expect(patch.updated[1].changedProperties.FieldOfView.Float32).to.equal(42)
+		assert(deleteOk, tostring(deletePatch))
+		expect(deletePatch.removed[1]).to.equal("CAMERA")
+	end)
+
 	it("should generate an empty patch for empty instances", function()
 		local knownInstances = InstanceMap.new()
 		local virtualInstances = {

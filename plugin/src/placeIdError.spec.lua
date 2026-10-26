@@ -1,0 +1,15 @@
+return function()
+	local placeIdError = require(script.Parent.placeIdError)
+
+	it("uses the same allow and deny policy for zero IDs and unrestricted projects", function()
+		expect(placeIdError({}, 0)).to.equal(nil)
+		expect(placeIdError({ expectedPlaceIds = { 0, 42 } }, 0)).to.equal(nil)
+		expect(placeIdError({ expectedPlaceIds = { 0, 42 } }, 42)).to.equal(nil)
+		expect(placeIdError({ expectedPlaceIds = { 0, 42 } }, 43)).never.to.equal(nil)
+		expect(placeIdError({ expectedPlaceIds = {} }, 0)).never.to.equal(nil)
+		expect(placeIdError({ unexpectedPlaceIds = { 42 } }, 0)).to.equal(nil)
+		local err = placeIdError({ unexpectedPlaceIds = { 42 } }, 42)
+		expect(string.find(err, "blockedPlaceIds", 1, true) ~= nil).to.equal(true)
+		expect(string.find(err, "42", 1, true) ~= nil).to.equal(true)
+	end)
+end

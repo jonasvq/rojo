@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
 };
 
@@ -8,7 +8,7 @@ use rbx_dom_weak::{
     ustr, Instance, InstanceBuilder, Ustr, UstrMap, WeakDom,
 };
 
-use crate::{multimap::MultiMap, RojoRef};
+use crate::{multimap::MultiMap, RojoRef, REF_POINTER_ATTRIBUTE_PREFIX};
 
 use super::{InstanceMetadata, InstanceSnapshot};
 
@@ -39,6 +39,12 @@ pub struct RojoTree {
     /// the same RojoRef for multiple different instances. An entry containing
     /// multiple elements is an error condition that should be raised to the user.
     specified_id_to_refs: MultiMap<RojoRef, Ref>,
+
+    // Reverse dependencies let target changes refresh unchanged owners without
+    // scanning the whole place for every filesystem event.
+    attribute_reference_targets: HashMap<Ref, Vec<(Ustr, RojoRef)>>,
+    attribute_reference_owners: MultiMap<RojoRef, Ref>,
+    dirty_reference_owners: HashSet<Ref>,
 }
 
 impl RojoTree {
@@ -52,11 +58,15 @@ impl RojoTree {
             metadata_map: HashMap::new(),
             path_to_ids: MultiMap::new(),
             specified_id_to_refs: MultiMap::new(),
+            attribute_reference_targets: HashMap::new(),
+            attribute_reference_owners: MultiMap::new(),
+            dirty_reference_owners: HashSet::new(),
         };
 
         let root_ref = tree.inner.root_ref();
 
         tree.insert_metadata(root_ref, snapshot.metadata);
+        tree.refresh_attribute_references(root_ref);
 
         for child in snapshot.children {
             tree.insert_instance(root_ref, child);
@@ -132,6 +142,7 @@ impl RojoTree {
 
         let referent = self.inner.insert(parent_ref, builder);
         self.insert_metadata(referent, snapshot.metadata);
+        self.refresh_attribute_references(referent);
 
         for child in snapshot.children {
             self.insert_instance(referent, child);
@@ -153,6 +164,34 @@ impl RojoTree {
         }
 
         self.inner.destroy(id);
+    }
+
+    pub(super) fn remove_many(&mut self, ids: &[Ref]) {
+        for &id in ids {
+            assert_ne!(id, self.get_root_id(), "cannot remove the tree root");
+            assert!(
+                self.inner.get_by_ref(id).is_some(),
+                "removed instance must exist"
+            );
+        }
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::from(ids.to_vec());
+        while let Some(id) = queue.pop_front() {
+            if visited.insert(id) {
+                queue.extend(
+                    self.inner
+                        .get_by_ref(id)
+                        .unwrap()
+                        .children()
+                        .iter()
+                        .copied(),
+                );
+                self.remove_metadata(id);
+            }
+        }
+        // WeakDom filters each surviving parent's child list once for the
+        // whole batch, avoiding quadratic work when a model loses many siblings.
+        self.inner.destroy_many(ids);
     }
 
     /// Replaces the metadata associated with the given instance ID.
@@ -184,9 +223,13 @@ impl RojoTree {
                         }
 
                         self.specified_id_to_refs.insert(new.clone(), id);
+                        self.dirty_reference_owners
+                            .extend(self.attribute_reference_owners.get(new).iter().copied());
                     }
                     if let Some(old) = &existing_metadata.specified_id {
                         self.specified_id_to_refs.remove(old, id);
+                        self.dirty_reference_owners
+                            .extend(self.attribute_reference_owners.get(old).iter().copied());
                     }
                 }
 
@@ -226,9 +269,78 @@ impl RojoTree {
         if let Some(metadata) = self.metadata_map.get_mut(&id) {
             if let Some(old) = metadata.specified_id.replace(specified.clone()) {
                 self.specified_id_to_refs.remove(&old, id);
+                self.dirty_reference_owners
+                    .extend(self.attribute_reference_owners.get(&old).iter().copied());
             }
         }
-        self.specified_id_to_refs.insert(specified, id);
+        self.specified_id_to_refs.insert(specified.clone(), id);
+        self.dirty_reference_owners.extend(
+            self.attribute_reference_owners
+                .get(&specified)
+                .iter()
+                .copied(),
+        );
+    }
+
+    pub(crate) fn refresh_attribute_references(&mut self, id: Ref) {
+        let mut targets = Vec::new();
+        if let Some(Variant::Attributes(attributes)) = self
+            .inner
+            .get_by_ref(id)
+            .and_then(|instance| instance.properties.get(&ustr("Attributes")))
+        {
+            for (name, value) in attributes.iter() {
+                let Some(property) = name.strip_prefix(REF_POINTER_ATTRIBUTE_PREFIX) else {
+                    continue;
+                };
+                let target = match value {
+                    Variant::String(value) => value.as_str(),
+                    Variant::BinaryString(value) => match std::str::from_utf8(value.as_ref()) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            log::warn!("Reference attribute {name} must contain a valid UTF-8 ID");
+                            continue;
+                        }
+                    },
+                    _ => {
+                        log::warn!(
+                            "Reference attribute {name} must be a String, not {:?}",
+                            value.ty()
+                        );
+                        continue;
+                    }
+                };
+                targets.push((ustr(property), RojoRef::new(target.to_owned())));
+            }
+        }
+        if let Some(previous) = self.attribute_reference_targets.remove(&id) {
+            for (_, target) in previous {
+                self.attribute_reference_owners.remove(target, id);
+            }
+        }
+        if targets.is_empty() {
+            self.dirty_reference_owners.remove(&id);
+        } else {
+            for (_, target) in &targets {
+                self.attribute_reference_owners.insert(target.clone(), id);
+            }
+            self.attribute_reference_targets.insert(id, targets);
+            self.dirty_reference_owners.insert(id);
+        }
+    }
+
+    pub(crate) fn take_dirty_attribute_references(&mut self) -> Vec<(Ref, Vec<(Ustr, RojoRef)>)> {
+        // Only owners of changed IDs or changed attributes need resolution.
+        // A whole-tree pass here makes ordinary file edits scale with the place.
+        std::mem::take(&mut self.dirty_reference_owners)
+            .into_iter()
+            .filter_map(|id| {
+                self.attribute_reference_targets
+                    .get(&id)
+                    .cloned()
+                    .map(|targets| (id, targets))
+            })
+            .collect()
     }
 
     fn insert_metadata(&mut self, id: Ref, metadata: InstanceMetadata) {
@@ -254,7 +366,19 @@ impl RojoTree {
 
         if let Some(specified) = metadata.specified_id {
             self.specified_id_to_refs.remove(&specified, id);
+            self.dirty_reference_owners.extend(
+                self.attribute_reference_owners
+                    .get(&specified)
+                    .iter()
+                    .copied(),
+            );
         }
+        if let Some(targets) = self.attribute_reference_targets.remove(&id) {
+            for (_, target) in targets {
+                self.attribute_reference_owners.remove(target, id);
+            }
+        }
+        self.dirty_reference_owners.remove(&id);
 
         for path in &metadata.relevant_paths {
             self.path_to_ids.remove(path, id);
@@ -400,6 +524,56 @@ mod test {
     };
 
     use super::RojoTree;
+
+    #[test]
+    fn bulk_removal_cleans_descendant_paths_and_invalidates_reference_owners() {
+        use rbx_dom_weak::types::Attributes;
+        let path = std::path::PathBuf::from("/models/map.rbxm");
+        let specified = RojoRef::new("target".into());
+        let mut attributes = Attributes::new();
+        attributes.insert("Rojo_Target_PrimaryPart".into(), "target".into());
+        let metadata = || InstanceMetadata::new().relevant_paths(vec![path.clone()]);
+        let mut tree = RojoTree::new(
+            InstanceSnapshot::new()
+                .property("Attributes", attributes)
+                .children(vec![
+                    InstanceSnapshot::new()
+                        .name("Removed")
+                        .metadata(metadata().specified_id(Some(specified.clone())))
+                        .children(vec![InstanceSnapshot::new().metadata(metadata())]),
+                    InstanceSnapshot::new().name("Kept").metadata(metadata()),
+                ]),
+        );
+        let root = tree.get_root_id();
+        let removed = tree.root().children()[0];
+        let descendant = tree.get_instance(removed).unwrap().children()[0];
+        let kept = tree.root().children()[1];
+        tree.take_dirty_attribute_references();
+        tree.remove_many(&[descendant, removed, removed]);
+        assert_eq!(tree.root().children(), &[kept]);
+        assert_eq!(tree.get_ids_at_path(&path), &[kept]);
+        assert_eq!(tree.get_specified_id(&specified), None);
+        assert!(!tree.metadata_map.contains_key(&removed));
+        assert!(!tree.metadata_map.contains_key(&descendant));
+        assert!(tree
+            .take_dirty_attribute_references()
+            .iter()
+            .any(|(owner, _)| *owner == root));
+    }
+
+    #[test]
+    fn bulk_removal_rejects_invalid_input_without_losing_metadata() {
+        let mut tree =
+            RojoTree::new(InstanceSnapshot::new().children(vec![InstanceSnapshot::new()]));
+        let root = tree.get_root_id();
+        let child = tree.root().children()[0];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tree.remove_many(&[child, root])
+        }));
+        assert!(result.is_err());
+        assert!(tree.get_instance(child).is_some());
+        assert_eq!(tree.root().children(), &[child]);
+    }
 
     #[test]
     fn swap_duped_specified_ids() {

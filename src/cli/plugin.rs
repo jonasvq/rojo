@@ -1,6 +1,7 @@
 use std::{
     fs::{self, File},
     io::BufWriter,
+    path::Path,
 };
 
 use clap::Parser;
@@ -76,8 +77,58 @@ fn install_plugin() -> anyhow::Result<()> {
     let tree = session.tree();
     let root_id = tree.get_root_id();
 
-    rbx_binary::to_writer(&mut file, tree.inner(), &[root_id])?;
+    crate::binary_serialization::to_writer(&mut file, tree.inner(), &[root_id])?;
 
+    Ok(())
+}
+
+pub(super) fn ensure_embedded_plugin(studio: &RobloxStudio) -> anyhow::Result<()> {
+    let bytes = embedded_plugin_bytes()?;
+    let path = studio.plugins_path().join(PLUGIN_FILE_NAME);
+    fs::create_dir_all(studio.plugins_path())?;
+    ensure_plugin_at(&path, &bytes)
+}
+
+fn embedded_plugin_bytes() -> anyhow::Result<Vec<u8>> {
+    let session = initialize_plugin()?;
+    let mut bytes = Vec::new();
+    {
+        let tree = session.tree();
+        crate::binary_serialization::to_writer(&mut bytes, tree.inner(), &[tree.get_root_id()])?;
+    }
+    Ok(bytes)
+}
+
+fn ensure_plugin_at(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => verify_existing_plugin(path, bytes, metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match super::open::publish_new_file(path, bytes) {
+                Ok(()) => Ok(()),
+                // A concurrent installer may have won the exclusive name.
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+                {
+                    verify_existing_plugin(path, bytes, fs::symlink_metadata(path)?)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn verify_existing_plugin(path: &Path, bytes: &[u8], metadata: fs::Metadata) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "Managed plugin destination is not a regular file: {}",
+        path.display()
+    );
+    anyhow::ensure!(fs::read(path)? == bytes,
+        "A different managed Rojo plugin exists at {}. Run rojo plugin install explicitly, or use --skip-plugin-install with a compatible installed plugin.",
+        path.display());
     Ok(())
 }
 
@@ -99,4 +150,73 @@ fn uninstall_plugin() -> anyhow::Result<()> {
 #[test]
 fn plugin_initialize() {
     let _ = initialize_plugin().unwrap();
+}
+
+#[cfg(test)]
+mod open_install_tests {
+    use super::*;
+
+    #[test]
+    fn actual_embedded_plugin_bytes_are_repeatable_and_include_launch_support() {
+        let one = embedded_plugin_bytes().unwrap();
+        let two = embedded_plugin_bytes().unwrap();
+        assert_eq!(one, two);
+        let dom = rbx_binary::from_reader(one.as_slice()).unwrap();
+        assert!(dom
+            .descendants()
+            .any(|instance| instance.name == "OpenLaunch" && instance.class == "ModuleScript"));
+        assert!(!dom
+            .descendants()
+            .any(|instance| instance.name == "OpenLaunch.spec"));
+    }
+
+    #[test]
+    fn guarded_install_creates_once_reuses_identical_and_refuses_other_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Managed.rbxm");
+        ensure_plugin_at(&path, b"current embedded plugin").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        ensure_plugin_at(&path, b"current embedded plugin").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        let error = ensure_plugin_at(&path, b"different version")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rojo plugin install"));
+        assert_eq!(fs::read(&path).unwrap(), b"current embedded plugin");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        let folder = dir.path().join("Folder.rbxm");
+        fs::create_dir(&folder).unwrap();
+        assert!(ensure_plugin_at(&folder, b"plugin").is_err());
+        assert!(folder.is_dir());
+    }
+
+    #[test]
+    fn concurrent_new_file_publishing_does_not_replace_the_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Managed.rbxm");
+        std::thread::scope(|scope| {
+            let one = scope.spawn(|| ensure_plugin_at(&path, b"same version"));
+            let two = scope.spawn(|| ensure_plugin_at(&path, b"same version"));
+            one.join().unwrap().unwrap();
+            two.join().unwrap().unwrap();
+        });
+        assert_eq!(fs::read(&path).unwrap(), b"same version");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn guarded_install_refuses_a_symlink_even_with_identical_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("UserPlugin.rbxm");
+        let link = dir.path().join("Managed.rbxm");
+        fs::write(&real, b"same version").unwrap();
+        if let Err(error) = std::os::windows::fs::symlink_file(&real, &link) {
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            return;
+        }
+        assert!(ensure_plugin_at(&link, b"same version").is_err());
+        assert_eq!(fs::read(&real).unwrap(), b"same version");
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
 }

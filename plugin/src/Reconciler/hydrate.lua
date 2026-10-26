@@ -18,7 +18,15 @@ local countMatchingProperties = require(script.Parent.countMatchingProperties)
 -- group regardless of how large the group is.
 local MAX_CANDIDATES_TO_SCORE = 32
 
-local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootInstance)
+local function hydrateInner(
+	stats,
+	instanceMap,
+	virtualInstances,
+	rootId,
+	rootInstance,
+	rememberedInstances,
+	removedByParent
+)
 	local virtualInstance = virtualInstances[rootId]
 
 	if virtualInstance == nil then
@@ -64,9 +72,42 @@ local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootIn
 	-- Tracks which existing children have already been paired, so one instance
 	-- isn't matched to two different virtual instances.
 	local visited = {}
+	if removedByParent and removedByParent[rootInstance] then
+		for id, instance in removedByParent[rootInstance] do
+			-- Keep deletions identifiable even when this parent preserves unknown
+			-- children. Reserve them so a newly created ID cannot reuse the object.
+			instanceMap:insert(id, instance)
+			visited[instance] = true
+		end
+	end
+	local rememberedChildren = {}
+	if rememberedInstances then
+		-- Reserve known identities before heuristic matching, otherwise an
+		-- earlier sibling could consume a later sibling's remembered instance.
+		for _, childId in virtualInstance.Children do
+			local candidate = rememberedInstances[childId]
+			if candidate and candidate.Parent == rootInstance and not visited[candidate] then
+				visited[candidate] = true
+				rememberedChildren[childId] = candidate
+			end
+		end
+	end
 
 	for _, childId in ipairs(virtualInstance.Children) do
 		local virtualChild = virtualInstances[childId]
+		local remembered = rememberedChildren[childId]
+		if remembered then
+			hydrateInner(
+				stats,
+				instanceMap,
+				virtualInstances,
+				childId,
+				remembered,
+				rememberedInstances,
+				removedByParent
+			)
+			continue
+		end
 
 		local bucketsByClassName = buckets[virtualChild.Name]
 		local bucket = bucketsByClassName and bucketsByClassName[virtualChild.ClassName]
@@ -162,11 +203,11 @@ local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootIn
 		end
 
 		visited[match] = true
-		hydrateInner(stats, instanceMap, virtualInstances, childId, match)
+		hydrateInner(stats, instanceMap, virtualInstances, childId, match, rememberedInstances, removedByParent)
 	end
 end
 
-local function hydrate(instanceMap, virtualInstances, rootId, rootInstance)
+local function hydrate(instanceMap, virtualInstances, rootId, rootInstance, rememberedInstances)
 	-- Tallies of the work hydration did, surfaced in a single debug log below so
 	-- the cost of property-based disambiguation is visible without per-node spam.
 	local stats = {
@@ -175,7 +216,18 @@ local function hydrate(instanceMap, virtualInstances, rootId, rootInstance)
 		candidatesScored = 0,
 	}
 
-	hydrateInner(stats, instanceMap, virtualInstances, rootId, rootInstance)
+	local removedByParent
+	if rememberedInstances then
+		removedByParent = {}
+		for id, instance in rememberedInstances do
+			local parent = instance.Parent
+			if virtualInstances[id] == nil and parent then
+				removedByParent[parent] = removedByParent[parent] or {}
+				removedByParent[parent][id] = instance
+			end
+		end
+	end
+	hydrateInner(stats, instanceMap, virtualInstances, rootId, rootInstance, rememberedInstances, removedByParent)
 
 	Log.debug(
 		"Hydrated {} instances ({} ambiguous name+class groups, {} candidates scored)",

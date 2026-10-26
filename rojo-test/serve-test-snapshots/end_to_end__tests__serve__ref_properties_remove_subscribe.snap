@@ -1,5 +1,6 @@
 ---
 source: tests/tests/serve.rs
+assertion_line: 561
 expression: "socket_packet.intern_and_redact(&mut redactions, ())"
 ---
 body:
@@ -8,6 +9,12 @@ body:
     - added: {}
       removed:
         - id-4
-      updated: []
+      updated:
+        - changedClassName: ~
+          changedMetadata: ~
+          changedName: ~
+          changedProperties:
+            Value: ~
+          id: id-3
 packetType: messages
 sessionId: id-1

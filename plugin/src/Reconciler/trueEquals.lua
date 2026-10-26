@@ -50,6 +50,13 @@ local function trueEquals(a, b): boolean
 	-- For numbers, compare with epsilon of 0.0001 to avoid floating point inequality
 	elseif typeA == "number" and typeB == "number" then
 		return fuzzyEq(a, b, 0.0001)
+	elseif typeA == "TweenInfo" and typeB == "TweenInfo" then
+		return fuzzyEq(a.Time, b.Time, 0.0001)
+			and fuzzyEq(a.DelayTime, b.DelayTime, 0.0001)
+			and a.EasingStyle == b.EasingStyle
+			and a.EasingDirection == b.EasingDirection
+			and a.RepeatCount == b.RepeatCount
+			and a.Reverses == b.Reverses
 
 	-- For EnumItem->number, compare the EnumItem's value
 	elseif typeA == "number" and typeB == "EnumItem" then

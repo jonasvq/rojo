@@ -76,7 +76,8 @@ end
 local function Header(props)
 	return Theme.with(function(theme)
 		return e("Frame", {
-			Size = UDim2.new(1, 0, 0, 32),
+			Size = UDim2.new(if props.fitContent then 0 else 1, 0, 0, 32),
+			AutomaticSize = if props.fitContent then Enum.AutomaticSize.X else Enum.AutomaticSize.None,
 			LayoutOrder = props.layoutOrder,
 			BackgroundTransparency = 1,
 		}, {

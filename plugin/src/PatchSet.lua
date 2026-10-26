@@ -226,6 +226,7 @@ function PatchSet.countChanges(patch)
 		for _ in update.changedProperties do
 			count += 1
 		end
+		count += #(update.removedProperties or {})
 		if update.changedName ~= nil then
 			count += 1
 		end
@@ -388,6 +389,9 @@ function PatchSet.humanSummary(instanceMap, patchSet)
 
 		for name in pairs(update.changedProperties) do
 			table.insert(updatedProperties, name)
+		end
+		for _, name in update.removedProperties or {} do
+			table.insert(updatedProperties, name .. " (reset)")
 		end
 
 		local instance = instanceMap.fromIds[update.id]

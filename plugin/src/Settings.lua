@@ -12,6 +12,7 @@ local Roact = require(Packages.Roact)
 local defaultSettings = {
 	openScriptsExternally = false,
 	twoWaySync = false,
+	adoptMatchingInstances = false,
 	autoReconnect = false,
 	showNotifications = true,
 	enableSyncFallback = true,
@@ -27,9 +28,15 @@ local defaultSettings = {
 	logLevel = "Info",
 	timingLogsEnabled = false,
 	priorEndpoints = {},
+	enableHeadlessAPI = true,
 }
 
 local Settings = {}
+
+function Settings:__default(name)
+	assert(defaultSettings[name] ~= nil, "Invalid settings name " .. tostring(name))
+	return defaultSettings[name]
+end
 
 Settings._values = table.clone(defaultSettings)
 Settings._updateListeners = {}
